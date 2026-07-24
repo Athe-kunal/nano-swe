@@ -22,6 +22,10 @@ train:
 
 fsdp:
   attn_implementation: sdpa
+  tp_size: 1 # tensor parallel
+  cp_size: 1 # context parallel (long sequences)
+  ep_size: 1 # expert parallel (MoE models)
+  pp_size: 1 # pipeline parallel (not yet supported by nano_swe trainers — must stay 1)
 
 ckpt:
   output_dir: ./ckpt/sft

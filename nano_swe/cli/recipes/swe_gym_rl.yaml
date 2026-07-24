@@ -36,6 +36,10 @@ rollout:
 vllm:
   num_engines: 1
   tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  data_parallel_size: 1 # raises EP past tensor_parallel_size (EP = TP * DP); needs enable_expert_parallel
+  enable_expert_parallel: false
+  decode_context_parallel_size: 1 # shards KV cache across decode workers for long contexts
 
 algo:
   advantage:
@@ -45,6 +49,10 @@ algo:
 
 fsdp:
   attn_implementation: sdpa
+  tp_size: 1 # tensor parallel
+  cp_size: 1 # context parallel (long sequences)
+  ep_size: 1 # expert parallel (MoE models)
+  pp_size: 1 # pipeline parallel (not yet supported by nano_swe trainers — must stay 1)
 
 ckpt:
   output_dir: ./ckpt/swe_gym_rl
