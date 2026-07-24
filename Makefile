@@ -32,5 +32,5 @@ run-eval-smoke:
 		--model $(EVAL_MODEL) \
 		--limit 1 \
 		-k 4 \
-		--max-concurrency 1 \
+		--max-concurrency 4 \
 		--wandb-run-name smoke-$(shell date +%Y%m%d-%H%M%S)

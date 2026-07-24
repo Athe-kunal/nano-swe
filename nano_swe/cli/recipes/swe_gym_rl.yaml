@@ -1,0 +1,54 @@
+# RL recipe for SWE-Gym via the OpenHands + Daytona rollout runner.
+#
+# Launch with: bash nano_swe/cli/recipes/swe_gym_rl.sh
+# (or directly: python3 -m nano_swe.cli.train_rl_ray --config nano_swe/cli/recipes/swe_gym_rl.yaml)
+# Any key here can still be overridden on the command line, e.g.
+#   ... --config nano_swe/cli/recipes/swe_gym_rl.yaml --rollout.n_samples_per_prompt 8
+#
+# KNOWN GAP: data.prompt_dataset must resolve through nano_swe.datasets.PromptDataset /
+# blending_datasets, which don't exist yet — this recipe assumes a JSONL manifest with one
+# {"input": "<harbor task dir>"} row per SWE-Gym task (see nano_swe/swe_data/build_dataset.py
+# for the task dirs themselves); building that manifest + loader is the next piece.
+
+actor:
+  model_name_or_path: null # required — set via MODEL_PATH (see swe_gym_rl.sh) or edit here
+  num_nodes: 1
+  num_gpus_per_node: 8
+
+data:
+  prompt_dataset: null # required — path to the prompt manifest described above
+  input_key: input
+  max_len: 8192
+
+train:
+  agent_path: "nano_swe.agents.swe_openhands:OpenHandsSWERunner"
+  batch_size: 32
+  micro_batch_size: 1
+  max_epochs: 1
+
+rollout:
+  batch_size: 32
+  n_samples_per_prompt: 4
+  num_runners: 4
+  temperature: 1.0
+  top_p: 1.0
+
+vllm:
+  num_engines: 1
+  tensor_parallel_size: 1
+
+algo:
+  advantage:
+    estimator: grpo
+  kl:
+    init_coef: 0.0
+
+fsdp:
+  attn_implementation: sdpa
+
+ckpt:
+  output_dir: ./ckpt/swe_gym_rl
+
+logger:
+  wandb:
+    project: nano-swe-rl

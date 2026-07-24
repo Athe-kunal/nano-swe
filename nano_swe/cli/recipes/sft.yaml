@@ -1,0 +1,31 @@
+# SFT recipe (e.g. warm-starting from OpenHands SWE-Gym trajectories before RL).
+#
+# Launch with: bash nano_swe/cli/recipes/sft.sh
+# (or directly: torchrun --standalone --nproc_per_node=8 -m nano_swe.cli.train_sft --config nano_swe/cli/recipes/sft.yaml)
+#
+# KNOWN GAP: data.dataset must resolve through nano_swe.datasets.SFTDataset / blending_datasets,
+# which don't exist yet (same gap as the RL recipe's prompt_dataset).
+
+model:
+  model_name_or_path: null # required — set via MODEL_PATH (see sft.sh) or edit here
+
+data:
+  dataset: null # required — path to the SFT jsonl/dataset
+  input_key: input
+  output_key: output
+  max_len: 8192
+
+train:
+  batch_size: 32
+  micro_batch_size: 1
+  max_epochs: 2
+
+fsdp:
+  attn_implementation: sdpa
+
+ckpt:
+  output_dir: ./ckpt/sft
+
+logger:
+  wandb:
+    project: nano-swe-sft
