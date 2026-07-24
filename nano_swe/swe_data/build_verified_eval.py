@@ -18,7 +18,7 @@ from datasets import load_dataset
 from nano_swe.swe_data.build_dataset import write_task
 
 DATASET_NAME = "princeton-nlp/SWE-bench_Verified"
-DEFAULT_SAMPLE_SIZE = 50
+DEFAULT_SAMPLE_SIZE = 20
 DEFAULT_SEED = 42
 
 
@@ -68,7 +68,7 @@ def build(output_dir: Path, sample_size: int, seed: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--output-dir", type=Path, default=Path(__file__).parent / "data" / "verified_eval_50"
+        "--output-dir", type=Path, default=Path(__file__).parent / "data" / "verified_eval_20"
     )
     parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
