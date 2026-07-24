@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Downloaded SWE-Gym datasets / generated Harbor tasks
+nano_swe/swe_data/data/
