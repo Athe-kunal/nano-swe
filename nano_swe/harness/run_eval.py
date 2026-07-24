@@ -69,6 +69,7 @@ def main() -> None:
     parser.add_argument("--base-url", default=None, help="Defaults to $OPENAI_BASE_URL.")
     parser.add_argument("--api-key", default=None, help="Defaults to $OPENAI_API_KEY.")
     parser.add_argument("-k", type=int, default=4, help="Rollouts per task for pass@k/avg@k.")
+    parser.add_argument("--limit", type=int, default=None, help="Only evaluate the first N tasks.")
     parser.add_argument("--max-iterations", type=int, default=30)
     parser.add_argument("--max-concurrency", type=int, default=8, help="Concurrent Daytona sandboxes.")
     parser.add_argument("--wandb-project", default="nano-swe-eval")
@@ -81,6 +82,8 @@ def main() -> None:
     task_dirs = sorted(p.parent for p in args.task_dir.glob("*/task.toml"))
     if not task_dirs:
         raise ValueError(f"No Harbor tasks found under {args.task_dir}")
+    if args.limit is not None:
+        task_dirs = task_dirs[: args.limit]
 
     rewards_by_task = run_pass_at_k(
         task_dirs,

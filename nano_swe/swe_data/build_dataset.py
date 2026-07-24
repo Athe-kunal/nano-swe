@@ -28,6 +28,15 @@ DATASETS = {
     "full": "SWE-Gym/SWE-Gym",
 }
 
+
+def docker_image_for(instance_id: str) -> str:
+    """The SWE-Gym/OpenHands author publishes one prebuilt image per instance on Docker Hub,
+    under this namespace/naming rule (SWE-bench's own official images use a different
+    namespace/separator; SWE-Gym's repos aren't part of SWE-bench so those don't cover it).
+    Docker repository names must be lowercase (e.g. Project-MONAI__MONAI-1121's image is
+    project-monai_s_monai-1121, not the instance_id's original casing)."""
+    return f"xingyaoww/sweb.eval.x86_64.{instance_id.replace('__', '_s_').lower()}:latest"
+
 INSTANCE_FIELDS = [
     "instance_id",
     "repo",
@@ -42,8 +51,9 @@ INSTANCE_FIELDS = [
 TEST_SH = """#!/bin/bash
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-pip install -q pytest-json-report >/dev/null 2>&1
-python3 "$DIR/grade.py"
+PY="${AGENT_PYTHON:-python3}"
+"$PY" -m pip install -q pytest-json-report >/dev/null 2>&1
+"$PY" "$DIR/grade.py"
 """
 
 GRADE_PY = '''"""Applies the test patch, runs pytest on FAIL_TO_PASS/PASS_TO_PASS, writes reward."""
@@ -51,6 +61,7 @@ GRADE_PY = '''"""Applies the test patch, runs pytest on FAIL_TO_PASS/PASS_TO_PAS
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 TASK_DIR = Path(__file__).parent
@@ -69,9 +80,11 @@ subprocess.run(
 # node ids (truncated parametrize ids). Passing an unresolvable id straight
 # to pytest aborts the whole run before anything executes, so collect first
 # and only ask pytest to run ids that actually exist.
+# sys.executable (not a bare "python"): on a SWE-bench prebuilt image, PATH's
+# python is the system one, not the repo's own conda env this script is invoked with.
 test_files = sorted({node_id.split("::")[0] for node_id in node_ids})
 collected = subprocess.run(
-    ["python", "-m", "pytest", "--collect-only", "-q", *test_files],
+    [sys.executable, "-m", "pytest", "--collect-only", "-q", *test_files],
     cwd=REPO_DIR,
     capture_output=True,
     text=True,
@@ -82,7 +95,7 @@ valid_ids = [node_id for node_id in node_ids if node_id in collected_ids]
 report_path = LOG_DIR / "report.json"
 if valid_ids:
     subprocess.run(
-        ["python", "-m", "pytest", "-q", "--json-report", f"--json-report-file={report_path}"]
+        [sys.executable, "-m", "pytest", "-q", "--json-report", f"--json-report-file={report_path}"]
         + valid_ids,
         cwd=REPO_DIR,
     )
@@ -106,8 +119,13 @@ def toml_string(value: str) -> str:
     return json.dumps(value)
 
 
-def write_task(instance: dict, dataset_name: str, task_dir: Path) -> None:
-    """Writes one SWE-Gym instance as a Harbor-format task directory."""
+def write_task(instance: dict, dataset_name: str, task_dir: Path, docker_image: str | None = None) -> None:
+    """Writes one SWE-Gym/SWE-bench instance as a Harbor-format task directory.
+
+    ``docker_image``, when given, is a prebuilt image with the repo already checked out and its
+    deps installed (e.g. SWE-bench's own ``swebench/sweb.eval.x86_64.<instance>`` images) — the
+    harness boots the sandbox straight from it instead of bootstrapping a plain image at runtime.
+    """
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / "solution").mkdir(exist_ok=True)
     (task_dir / "tests").mkdir(exist_ok=True)
@@ -118,6 +136,11 @@ dataset = {toml_string(dataset_name)}
 repo = {toml_string(instance["repo"])}
 version = {toml_string(instance["version"])}
 base_commit = {toml_string(instance["base_commit"])}
+"""
+    if docker_image:
+        task_toml += f"""
+[environment]
+docker_image = {toml_string(docker_image)}
 """
     (task_dir / "task.toml").write_text(task_toml)
 
@@ -149,7 +172,8 @@ def build(dataset_name: str, split: str, output_dir: Path, limit: int | None) ->
 
     output_dir.mkdir(parents=True, exist_ok=True)
     for instance in dataset:
-        write_task(instance, dataset_name, output_dir / instance["instance_id"])
+        docker_image = docker_image_for(instance["instance_id"])
+        write_task(instance, dataset_name, output_dir / instance["instance_id"], docker_image=docker_image)
 
     print(f"Wrote {len(dataset)} tasks from {dataset_name} ({split}) to {output_dir}")
 

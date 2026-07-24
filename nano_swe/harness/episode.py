@@ -1,14 +1,22 @@
-"""Runs one Harbor task end-to-end in a fresh Daytona sandbox: clone the task's repo at its base
-commit, run an OpenHands agent against the task instruction (against whatever OpenAI-compatible
-``base_url`` the caller passes — Fireworks for a smoke test, or our own chat proxy in front of the
-training-time vLLM policy for a real RL rollout), then grade the result with the task's own
-tests/grade.py and return the reward.
+"""Runs one Harbor task end-to-end in a fresh Daytona sandbox: boot from the task's prebuilt
+docker image (repo already cloned/installed, in a conda env named "testbed" per SWE-bench's own
+Dockerfiles), run an OpenHands agent against the task instruction (against whatever
+OpenAI-compatible ``base_url`` the caller passes — Fireworks for a smoke test, or our own chat
+proxy in front of the training-time vLLM policy for a real RL rollout), then grade the result
+with the task's own tests/grade.py and return the reward.
+
+Every task.toml this harness runs must set ``[environment] docker_image`` — see
+build_dataset.py/build_verified_eval.py, which set it for every SWE-Gym and SWE-bench
+Verified/Lite instance from the images their respective authors publish on Docker Hub.
 """
 
 import tomllib
 from pathlib import Path
 
 from daytona import CreateSandboxFromImageParams, Daytona, Sandbox
+
+TESTBED_PYTHON = "/opt/miniconda3/envs/testbed/bin/python"  # SWE-bench harness convention
+SANDBOX_CREATE_TIMEOUT = 600  # some images (e.g. PyTorch/CUDA-heavy repos) are multi-GB pulls
 
 DRIVER_PY = '''"""Runs an OpenHands agent against the task instruction. Executed inside the sandbox."""
 
@@ -22,6 +30,7 @@ from openhands.tools.preset.default import get_default_agent
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", required=True)
+parser.add_argument("--workdir", required=True)
 parser.add_argument("--max-iterations", type=int, default=30)
 parser.add_argument("--native-tool-calling", choices=["true", "false"], default="true")
 args = parser.parse_args()
@@ -36,7 +45,7 @@ llm = LLM(
     native_tool_calling=args.native_tool_calling == "true",
 )
 agent = get_default_agent(llm=llm, cli_mode=True)
-workspace = LocalWorkspace(working_dir="/workspace/repo")
+workspace = LocalWorkspace(working_dir=args.workdir)
 conversation = Conversation(agent=agent, workspace=workspace, max_iteration_per_run=args.max_iterations)
 
 try:
@@ -72,12 +81,12 @@ def run_episode(
     model: str,
     max_iterations: int = 30,
     native_tool_calling: bool = True,
-    image: str = "python:3.12-slim",
 ) -> dict:
     """Runs one Harbor task end-to-end in a fresh Daytona sandbox.
 
     Args:
-        task_dir: A Harbor task directory (see nano_swe/swe_data/build_dataset.py).
+        task_dir: A Harbor task directory (see nano_swe/swe_data/build_dataset.py) whose
+            task.toml sets [environment] docker_image.
         base_url: OpenAI-compatible endpoint the in-sandbox OpenHands agent talks to.
         api_key: API key/token for that endpoint (any non-empty string if unused).
         model: Model name to request from that endpoint.
@@ -85,29 +94,29 @@ def run_episode(
         native_tool_calling: Whether the endpoint understands OpenAI-style `tools=[...]` /
             `tool_calls` (True for Fireworks and most hosted APIs; False for a plain
             text-completion proxy that can't format tool_calls JSON).
-        image: Docker image the sandbox boots from.
 
     Returns:
         {"reward": float, "sandbox_id": str}.
     """
-    task = tomllib.loads((task_dir / "task.toml").read_text())["metadata"]
+    toml = tomllib.loads((task_dir / "task.toml").read_text())
+    task = toml["metadata"]
+    docker_image = toml.get("environment", {}).get("docker_image")
+    if not docker_image:
+        raise ValueError(f"{task_dir}/task.toml has no [environment] docker_image")
     instruction = (task_dir / "instruction.md").read_text()
-    repo_url = f"https://github.com/{task['repo']}.git"
+    repo_dir = "/testbed"
 
     daytona = Daytona()
-    sandbox = daytona.create(CreateSandboxFromImageParams(image=image), timeout=120)
+    sandbox = daytona.create(CreateSandboxFromImageParams(image=docker_image), timeout=SANDBOX_CREATE_TIMEOUT)
     print(f"Created sandbox {sandbox.id} for {task['task_id']} ({task['repo']}@{task['base_commit'][:7]})")
     try:
-        _run(
-            sandbox,
-            "apt-get update -qq && apt-get install -y -qq git build-essential",
-            env={"DEBIAN_FRONTEND": "noninteractive"},
-        )
-        _run(sandbox, f"git clone --quiet {repo_url} /workspace/repo")
-        _run(sandbox, f"git checkout --quiet {task['base_commit']}", cwd="/workspace/repo")
-        _run(sandbox, "pip install -q -e '.[all]' || pip install -q -e .", cwd="/workspace/repo", check=False)
-        _run(sandbox, "pip install -q -r requirements-tests.txt", cwd="/workspace/repo", check=False)
-        _run(sandbox, "pip install -q openhands-sdk openhands-tools pytest-json-report", timeout=1200)
+        # The image's "testbed" conda env may predate openhands-sdk's >=3.12 requirement, so the
+        # agent gets its own uv-managed interpreter instead of touching the repo's env at all.
+        oh_python = "/opt/oh-venv/bin/python"
+        _run(sandbox, "curl -LsSf https://astral.sh/uv/install.sh | sh")
+        _run(sandbox, "~/.local/bin/uv venv --python 3.12 /opt/oh-venv")
+        _run(sandbox, f"~/.local/bin/uv pip install --python {oh_python} openhands-sdk openhands-tools")
+        _run(sandbox, f"{TESTBED_PYTHON} -m pip install -q pytest-json-report")
 
         sandbox.fs.create_folder("/workspace/task/tests", "755")
         sandbox.fs.upload_file(instruction.encode(), "/workspace/task/instruction.md")
@@ -117,7 +126,8 @@ def run_episode(
 
         _run(
             sandbox,
-            f"python /workspace/driver.py --model {model} --max-iterations {max_iterations} "
+            f"{oh_python} /workspace/driver.py --model {model} --workdir {repo_dir} "
+            f"--max-iterations {max_iterations} "
             f"--native-tool-calling {'true' if native_tool_calling else 'false'}",
             cwd="/workspace",
             timeout=900,
@@ -126,10 +136,10 @@ def run_episode(
 
         _run(
             sandbox,
-            "python /workspace/task/tests/grade.py",
+            f"{TESTBED_PYTHON} /workspace/task/tests/grade.py",
             cwd="/workspace",
             timeout=600,
-            env={"AGENT_WORKDIR": "/workspace/repo"},
+            env={"AGENT_WORKDIR": repo_dir},
         )
         reward = float(sandbox.fs.download_file("/logs/verifier/reward.txt").decode())
         print(f"REWARD: {reward}")

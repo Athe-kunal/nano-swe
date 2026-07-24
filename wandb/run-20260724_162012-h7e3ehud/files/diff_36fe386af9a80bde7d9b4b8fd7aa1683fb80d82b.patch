@@ -1,0 +1,389 @@
+diff --git a/Makefile b/Makefile
+index 42a2f41..f520ef9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,4 +1,4 @@
+-.PHONY: download-dataset download-dataset-full download-verified-eval run-eval
++.PHONY: download-dataset download-dataset-full download-verified-eval run-eval run-eval-smoke
+ 
+ download-dataset:
+ 	uv run python -m nano_swe.swe_data.build_dataset --dataset lite
+@@ -24,3 +24,13 @@ run-eval:
+ 		-k $(EVAL_K) \
+ 		--max-concurrency $(EVAL_NUM_WORKERS) \
+ 		--wandb-run-name $(EVAL_WANDB_RUN_NAME)
++
++# One task, one rollout: quick check that the pipeline launches end-to-end.
++run-eval-smoke:
++	uv run python -m nano_swe.harness.run_eval \
++		--task-dir $(EVAL_TASK_DIR) \
++		--model $(EVAL_MODEL) \
++		--limit 1 \
++		-k 1 \
++		--max-concurrency 1 \
++		--wandb-run-name smoke-$(shell date +%Y%m%d-%H%M%S)
+diff --git a/nano_swe/agents/swe_openhands.py b/nano_swe/agents/swe_openhands.py
+index d8e3781..154bbff 100644
+--- a/nano_swe/agents/swe_openhands.py
++++ b/nano_swe/agents/swe_openhands.py
+@@ -14,7 +14,6 @@ from nano_swe.agents.base import AgentRunner, Trajectory, _first_scalar
+ from nano_swe.agents.chat_proxy import ChatProxyServer
+ 
+ DEFAULT_MAX_ITERATIONS = 30
+-SANDBOX_IMAGE = "python:3.12-slim"
+ 
+ # Per-runner (per Ray actor) concurrent-sandbox cap; total cluster concurrency is this times
+ # --rollout.num_runners. Scale out via this env var and/or --rollout.num_runners.
+@@ -82,5 +81,4 @@ def _run_episode_sync(task_dir: Path, base_url: str) -> dict:
+         model="policy",
+         max_iterations=DEFAULT_MAX_ITERATIONS,
+         native_tool_calling=False,
+-        image=SANDBOX_IMAGE,
+     )
+diff --git a/nano_swe/harness/episode.py b/nano_swe/harness/episode.py
+index 15bf365..5b5dd61 100644
+--- a/nano_swe/harness/episode.py
++++ b/nano_swe/harness/episode.py
+@@ -1,8 +1,13 @@
+-"""Runs one Harbor task end-to-end in a fresh Daytona sandbox: clone the task's repo at its base
+-commit, run an OpenHands agent against the task instruction (against whatever OpenAI-compatible
+-``base_url`` the caller passes — Fireworks for a smoke test, or our own chat proxy in front of the
+-training-time vLLM policy for a real RL rollout), then grade the result with the task's own
+-tests/grade.py and return the reward.
++"""Runs one Harbor task end-to-end in a fresh Daytona sandbox: get the task's repo checked out
++at its base commit, run an OpenHands agent against the task instruction (against whatever
++OpenAI-compatible ``base_url`` the caller passes — Fireworks for a smoke test, or our own chat
++proxy in front of the training-time vLLM policy for a real RL rollout), then grade the result
++with the task's own tests/grade.py and return the reward.
++
++When the task's task.toml sets ``[environment] docker_image`` (SWE-bench Verified/Lite tasks do —
++see build_verified_eval.py), the sandbox boots straight from that prebuilt image (repo already
++cloned/installed, in a conda env named "testbed" per SWE-bench's own Dockerfiles) instead of
++bootstrapping a generic image at runtime — SWE-Gym tasks have no such image, so they still do.
+ """
+ 
+ import tomllib
+@@ -10,6 +15,9 @@ from pathlib import Path
+ 
+ from daytona import CreateSandboxFromImageParams, Daytona, Sandbox
+ 
++GENERIC_IMAGE = "python:3.12-slim"
++TESTBED_PYTHON = "/opt/miniconda3/envs/testbed/bin/python"  # SWE-bench harness convention
++
+ DRIVER_PY = '''"""Runs an OpenHands agent against the task instruction. Executed inside the sandbox."""
+ 
+ import argparse
+@@ -22,6 +30,7 @@ from openhands.tools.preset.default import get_default_agent
+ 
+ parser = argparse.ArgumentParser()
+ parser.add_argument("--model", required=True)
++parser.add_argument("--workdir", required=True)
+ parser.add_argument("--max-iterations", type=int, default=30)
+ parser.add_argument("--native-tool-calling", choices=["true", "false"], default="true")
+ args = parser.parse_args()
+@@ -36,7 +45,7 @@ llm = LLM(
+     native_tool_calling=args.native_tool_calling == "true",
+ )
+ agent = get_default_agent(llm=llm, cli_mode=True)
+-workspace = LocalWorkspace(working_dir="/workspace/repo")
++workspace = LocalWorkspace(working_dir=args.workdir)
+ conversation = Conversation(agent=agent, workspace=workspace, max_iteration_per_run=args.max_iterations)
+ 
+ try:
+@@ -72,7 +81,6 @@ def run_episode(
+     model: str,
+     max_iterations: int = 30,
+     native_tool_calling: bool = True,
+-    image: str = "python:3.12-slim",
+ ) -> dict:
+     """Runs one Harbor task end-to-end in a fresh Daytona sandbox.
+ 
+@@ -85,29 +93,58 @@ def run_episode(
+         native_tool_calling: Whether the endpoint understands OpenAI-style `tools=[...]` /
+             `tool_calls` (True for Fireworks and most hosted APIs; False for a plain
+             text-completion proxy that can't format tool_calls JSON).
+-        image: Docker image the sandbox boots from.
+ 
+     Returns:
+         {"reward": float, "sandbox_id": str}.
+     """
+-    task = tomllib.loads((task_dir / "task.toml").read_text())["metadata"]
++    toml = tomllib.loads((task_dir / "task.toml").read_text())
++    task = toml["metadata"]
++    docker_image = toml.get("environment", {}).get("docker_image")
+     instruction = (task_dir / "instruction.md").read_text()
+     repo_url = f"https://github.com/{task['repo']}.git"
++    repo_dir = "/testbed" if docker_image else "/workspace/repo"
+ 
+     daytona = Daytona()
+-    sandbox = daytona.create(CreateSandboxFromImageParams(image=image), timeout=120)
++    sandbox = daytona.create(CreateSandboxFromImageParams(image=docker_image or GENERIC_IMAGE), timeout=120)
+     print(f"Created sandbox {sandbox.id} for {task['task_id']} ({task['repo']}@{task['base_commit'][:7]})")
+     try:
+-        _run(
+-            sandbox,
+-            "apt-get update -qq && apt-get install -y -qq git build-essential",
+-            env={"DEBIAN_FRONTEND": "noninteractive"},
+-        )
+-        _run(sandbox, f"git clone --quiet {repo_url} /workspace/repo")
+-        _run(sandbox, f"git checkout --quiet {task['base_commit']}", cwd="/workspace/repo")
+-        _run(sandbox, "pip install -q -e '.[all]' || pip install -q -e .", cwd="/workspace/repo", check=False)
+-        _run(sandbox, "pip install -q -r requirements-tests.txt", cwd="/workspace/repo", check=False)
+-        _run(sandbox, "pip install -q openhands-sdk openhands-tools pytest-json-report", timeout=1200)
++        if docker_image:
++            # Repo is already cloned/installed in the image's "testbed" conda env; that env's
++            # python may predate openhands-sdk's >=3.12 requirement, so the agent gets its own
++            # uv-managed interpreter instead of touching the repo's env at all.
++            oh_python = "/opt/oh-venv/bin/python"
++            _run(sandbox, "curl -LsSf https://astral.sh/uv/install.sh | sh")
++            _run(sandbox, "~/.local/bin/uv venv --python 3.12 /opt/oh-venv")
++            _run(sandbox, f"~/.local/bin/uv pip install --python {oh_python} openhands-sdk openhands-tools")
++            grade_python = TESTBED_PYTHON
++            _run(sandbox, f"{grade_python} -m pip install -q pytest-json-report")
++        else:
++            _run(
++                sandbox,
++                "apt-get update -qq && apt-get install -y -qq git build-essential",
++                env={"DEBIAN_FRONTEND": "noninteractive"},
++            )
++            _run(sandbox, f"git clone --quiet {repo_url} {repo_dir}")
++            _run(sandbox, f"git checkout --quiet {task['base_commit']}", cwd=repo_dir)
++            # `pip install -e .` builds in an ISOLATED env that resolves its own fresh setuptools
++            # regardless of what's installed outside it, so a pin only takes effect with
++            # --no-build-isolation. Try the normal (isolated) install first — most repos are
++            # fine — and only fall back to an old pinned setuptools for repos whose
++            # setup_package.py still imports APIs (e.g. setuptools.dep_util) modern setuptools
++            # removed (astropy, etc.).
++            _run(
++                sandbox,
++                "pip install -q -e '.[all]' || pip install -q -e . || "
++                "(pip install -q 'setuptools<66' && "
++                "(pip install -q --no-build-isolation -e '.[all]' || "
++                "pip install -q --no-build-isolation -e .))",
++                cwd=repo_dir,
++                check=False,
++            )
++            _run(sandbox, "pip install -q -r requirements-tests.txt", cwd=repo_dir, check=False)
++            _run(sandbox, "pip install -q openhands-sdk openhands-tools pytest-json-report", timeout=1200)
++            oh_python = "python"
++            grade_python = "python3"
+ 
+         sandbox.fs.create_folder("/workspace/task/tests", "755")
+         sandbox.fs.upload_file(instruction.encode(), "/workspace/task/instruction.md")
+@@ -117,7 +154,8 @@ def run_episode(
+ 
+         _run(
+             sandbox,
+-            f"python /workspace/driver.py --model {model} --max-iterations {max_iterations} "
++            f"{oh_python} /workspace/driver.py --model {model} --workdir {repo_dir} "
++            f"--max-iterations {max_iterations} "
+             f"--native-tool-calling {'true' if native_tool_calling else 'false'}",
+             cwd="/workspace",
+             timeout=900,
+@@ -126,10 +164,10 @@ def run_episode(
+ 
+         _run(
+             sandbox,
+-            "python /workspace/task/tests/grade.py",
++            f"{grade_python} /workspace/task/tests/grade.py",
+             cwd="/workspace",
+             timeout=600,
+-            env={"AGENT_WORKDIR": "/workspace/repo"},
++            env={"AGENT_WORKDIR": repo_dir},
+         )
+         reward = float(sandbox.fs.download_file("/logs/verifier/reward.txt").decode())
+         print(f"REWARD: {reward}")
+diff --git a/nano_swe/harness/run_dummy_episode.py b/nano_swe/harness/run_dummy_episode.py
+deleted file mode 100644
+index f57a7d6..0000000
+--- a/nano_swe/harness/run_dummy_episode.py
++++ /dev/null
+@@ -1,43 +0,0 @@
+-"""Smoke test: runs one Harbor task end-to-end in a real Daytona sandbox.
+-
+-Pipeline: spin up a Daytona sandbox, clone the task's repo at its base commit,
+-run an OpenHands agent (backed by a Fireworks model) against the task's
+-instruction, then grade the result with the task's own tests/grade.py.
+-
+-This is a one-off harness smoke test, not the training loop (see nano_swe/agents
+-for the RL rollout path, which runs the same episode against the training-time
+-vLLM policy instead of Fireworks).
+-"""
+-
+-import argparse
+-import os
+-from pathlib import Path
+-
+-from dotenv import load_dotenv
+-
+-from nano_swe.harness.episode import run_episode
+-
+-DEFAULT_MODEL = "openai/accounts/fireworks/models/gpt-oss-120b"
+-DEFAULT_TASK_DIR = Path(__file__).parent.parent / "swe_data" / "data" / "lite" / "getmoto__moto-5752"
+-
+-
+-def main() -> None:
+-    """Parses CLI args and runs the dummy episode."""
+-    parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("--task-dir", type=Path, default=DEFAULT_TASK_DIR)
+-    parser.add_argument("--model", default=DEFAULT_MODEL)
+-    parser.add_argument("--max-iterations", type=int, default=30)
+-    args = parser.parse_args()
+-
+-    load_dotenv()
+-    run_episode(
+-        args.task_dir,
+-        base_url=os.environ["OPENAI_BASE_URL"],
+-        api_key=os.environ["OPENAI_API_KEY"],
+-        model=args.model,
+-        max_iterations=args.max_iterations,
+-    )
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/nano_swe/harness/run_eval.py b/nano_swe/harness/run_eval.py
+index 2ce1d83..6b7f366 100644
+--- a/nano_swe/harness/run_eval.py
++++ b/nano_swe/harness/run_eval.py
+@@ -69,6 +69,7 @@ def main() -> None:
+     parser.add_argument("--base-url", default=None, help="Defaults to $OPENAI_BASE_URL.")
+     parser.add_argument("--api-key", default=None, help="Defaults to $OPENAI_API_KEY.")
+     parser.add_argument("-k", type=int, default=4, help="Rollouts per task for pass@k/avg@k.")
++    parser.add_argument("--limit", type=int, default=None, help="Only evaluate the first N tasks.")
+     parser.add_argument("--max-iterations", type=int, default=30)
+     parser.add_argument("--max-concurrency", type=int, default=8, help="Concurrent Daytona sandboxes.")
+     parser.add_argument("--wandb-project", default="nano-swe-eval")
+@@ -81,6 +82,8 @@ def main() -> None:
+     task_dirs = sorted(p.parent for p in args.task_dir.glob("*/task.toml"))
+     if not task_dirs:
+         raise ValueError(f"No Harbor tasks found under {args.task_dir}")
++    if args.limit is not None:
++        task_dirs = task_dirs[: args.limit]
+ 
+     rewards_by_task = run_pass_at_k(
+         task_dirs,
+diff --git a/nano_swe/swe_data/build_dataset.py b/nano_swe/swe_data/build_dataset.py
+index 2034d02..4b82b47 100644
+--- a/nano_swe/swe_data/build_dataset.py
++++ b/nano_swe/swe_data/build_dataset.py
+@@ -28,6 +28,13 @@ DATASETS = {
+     "full": "SWE-Gym/SWE-Gym",
+ }
+ 
++
++def docker_image_for(instance_id: str) -> str:
++    """The SWE-Gym/OpenHands author publishes one prebuilt image per instance on Docker Hub,
++    under this namespace/naming rule (SWE-bench's own official images use a different
++    namespace/separator; SWE-Gym's repos aren't part of SWE-bench so those don't cover it)."""
++    return f"xingyaoww/sweb.eval.x86_64.{instance_id.replace('__', '_s_')}:latest"
++
+ INSTANCE_FIELDS = [
+     "instance_id",
+     "repo",
+@@ -42,8 +49,9 @@ INSTANCE_FIELDS = [
+ TEST_SH = """#!/bin/bash
+ set -uo pipefail
+ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+-pip install -q pytest-json-report >/dev/null 2>&1
+-python3 "$DIR/grade.py"
++PY="${AGENT_PYTHON:-python3}"
++"$PY" -m pip install -q pytest-json-report >/dev/null 2>&1
++"$PY" "$DIR/grade.py"
+ """
+ 
+ GRADE_PY = '''"""Applies the test patch, runs pytest on FAIL_TO_PASS/PASS_TO_PASS, writes reward."""
+@@ -51,6 +59,7 @@ GRADE_PY = '''"""Applies the test patch, runs pytest on FAIL_TO_PASS/PASS_TO_PAS
+ import json
+ import os
+ import subprocess
++import sys
+ from pathlib import Path
+ 
+ TASK_DIR = Path(__file__).parent
+@@ -69,9 +78,11 @@ subprocess.run(
+ # node ids (truncated parametrize ids). Passing an unresolvable id straight
+ # to pytest aborts the whole run before anything executes, so collect first
+ # and only ask pytest to run ids that actually exist.
++# sys.executable (not a bare "python"): on a SWE-bench prebuilt image, PATH's
++# python is the system one, not the repo's own conda env this script is invoked with.
+ test_files = sorted({node_id.split("::")[0] for node_id in node_ids})
+ collected = subprocess.run(
+-    ["python", "-m", "pytest", "--collect-only", "-q", *test_files],
++    [sys.executable, "-m", "pytest", "--collect-only", "-q", *test_files],
+     cwd=REPO_DIR,
+     capture_output=True,
+     text=True,
+@@ -82,7 +93,7 @@ valid_ids = [node_id for node_id in node_ids if node_id in collected_ids]
+ report_path = LOG_DIR / "report.json"
+ if valid_ids:
+     subprocess.run(
+-        ["python", "-m", "pytest", "-q", "--json-report", f"--json-report-file={report_path}"]
++        [sys.executable, "-m", "pytest", "-q", "--json-report", f"--json-report-file={report_path}"]
+         + valid_ids,
+         cwd=REPO_DIR,
+     )
+@@ -106,8 +117,13 @@ def toml_string(value: str) -> str:
+     return json.dumps(value)
+ 
+ 
+-def write_task(instance: dict, dataset_name: str, task_dir: Path) -> None:
+-    """Writes one SWE-Gym instance as a Harbor-format task directory."""
++def write_task(instance: dict, dataset_name: str, task_dir: Path, docker_image: str | None = None) -> None:
++    """Writes one SWE-Gym/SWE-bench instance as a Harbor-format task directory.
++
++    ``docker_image``, when given, is a prebuilt image with the repo already checked out and its
++    deps installed (e.g. SWE-bench's own ``swebench/sweb.eval.x86_64.<instance>`` images) — the
++    harness boots the sandbox straight from it instead of bootstrapping a plain image at runtime.
++    """
+     task_dir.mkdir(parents=True, exist_ok=True)
+     (task_dir / "solution").mkdir(exist_ok=True)
+     (task_dir / "tests").mkdir(exist_ok=True)
+@@ -118,6 +134,11 @@ dataset = {toml_string(dataset_name)}
+ repo = {toml_string(instance["repo"])}
+ version = {toml_string(instance["version"])}
+ base_commit = {toml_string(instance["base_commit"])}
++"""
++    if docker_image:
++        task_toml += f"""
++[environment]
++docker_image = {toml_string(docker_image)}
+ """
+     (task_dir / "task.toml").write_text(task_toml)
+ 
+@@ -149,7 +170,8 @@ def build(dataset_name: str, split: str, output_dir: Path, limit: int | None) ->
+ 
+     output_dir.mkdir(parents=True, exist_ok=True)
+     for instance in dataset:
+-        write_task(instance, dataset_name, output_dir / instance["instance_id"])
++        docker_image = docker_image_for(instance["instance_id"])
++        write_task(instance, dataset_name, output_dir / instance["instance_id"], docker_image=docker_image)
+ 
+     print(f"Wrote {len(dataset)} tasks from {dataset_name} ({split}) to {output_dir}")
+ 
+diff --git a/nano_swe/swe_data/build_verified_eval.py b/nano_swe/swe_data/build_verified_eval.py
+index 10386fd..b70b992 100644
+--- a/nano_swe/swe_data/build_verified_eval.py
++++ b/nano_swe/swe_data/build_verified_eval.py
+@@ -22,6 +22,11 @@ DEFAULT_SAMPLE_SIZE = 20
+ DEFAULT_SEED = 42
+ 
+ 
++def docker_image_for(instance_id: str) -> str:
++    """SWE-bench publishes one prebuilt image per instance on Docker Hub under this naming rule."""
++    return f"swebench/sweb.eval.x86_64.{instance_id.replace('__', '_1776_')}:latest"
++
++
+ def stratified_sample_by_repo(instances: list[dict], sample_size: int, seed: int) -> list[dict]:
+     """Round-robins across repos (each repo's instances pre-shuffled) so no repo dominates."""
+     by_repo: dict[str, list[dict]] = defaultdict(list)
+@@ -55,7 +60,8 @@ def build(output_dir: Path, sample_size: int, seed: int) -> None:
+ 
+     output_dir.mkdir(parents=True, exist_ok=True)
+     for instance in sample:
+-        write_task(instance, DATASET_NAME, output_dir / instance["instance_id"])
++        docker_image = docker_image_for(instance["instance_id"])
++        write_task(instance, DATASET_NAME, output_dir / instance["instance_id"], docker_image=docker_image)
+ 
+     repo_counts: dict[str, int] = defaultdict(int)
+     for instance in sample:

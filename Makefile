@@ -1,4 +1,4 @@
-.PHONY: download-dataset download-dataset-full download-verified-eval run-eval
+.PHONY: download-dataset download-dataset-full download-verified-eval run-eval run-eval-smoke
 
 download-dataset:
 	uv run python -m nano_swe.swe_data.build_dataset --dataset lite
@@ -24,3 +24,13 @@ run-eval:
 		-k $(EVAL_K) \
 		--max-concurrency $(EVAL_NUM_WORKERS) \
 		--wandb-run-name $(EVAL_WANDB_RUN_NAME)
+
+# One task, one rollout: quick check that the pipeline launches end-to-end.
+run-eval-smoke:
+	uv run python -m nano_swe.harness.run_eval \
+		--task-dir $(EVAL_TASK_DIR) \
+		--model $(EVAL_MODEL) \
+		--limit 1 \
+		-k 4 \
+		--max-concurrency 1 \
+		--wandb-run-name smoke-$(shell date +%Y%m%d-%H%M%S)

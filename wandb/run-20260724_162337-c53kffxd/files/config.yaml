@@ -1,0 +1,114 @@
+_wandb:
+    value:
+        cli_version: 0.28.1
+        e:
+            zam9peue87xsd6whs8um2dyafh0rdh04:
+                args:
+                    - --task-dir
+                    - nano_swe/swe_data/data/lite
+                    - --model
+                    - openai/accounts/fireworks/models/gpt-oss-120b
+                    - --limit
+                    - "1"
+                    - -k
+                    - "1"
+                    - --max-concurrency
+                    - "1"
+                    - --wandb-run-name
+                    - smoke-20260724-162131
+                cpu_count: 128
+                cpu_count_logical: 128
+                cudaVersion: "12.4"
+                disk:
+                    /:
+                        total: "105089261568"
+                        used: "96021995520"
+                email: astmohap@iu.edu
+                executable: /home/recoverx/astarag/nano-swe/.venv/bin/python3
+                git:
+                    commit: 36fe386af9a80bde7d9b4b8fd7aa1683fb80d82b
+                    remote: https://github.com/Athe-kunal/nano-swe.git
+                gpu: NVIDIA A100 80GB PCIe
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100 80GB PCIe
+                      uuid: GPU-93f06fe9-fce7-8f08-be69-a90b534e8cd7
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100 80GB PCIe
+                      uuid: GPU-9a85a067-a08d-2636-4d21-0cb3f00d74e4
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100 80GB PCIe
+                      uuid: GPU-f724fd87-c127-b893-a793-e35bc6e66ae1
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100 80GB PCIe
+                      uuid: GPU-aee6581d-3454-a0e3-8816-181eaccffdc4
+                host: koozie-00
+                memory:
+                    total: "1082026205184"
+                os: Linux-5.15.0-177-generic-x86_64-with-glibc2.35
+                program: -m nano_swe.harness.run_eval
+                python: CPython 3.13.3
+                root: /home/recoverx/astarag/nano-swe
+                startedAt: "2026-07-24T21:23:37.422704Z"
+                writerId: zam9peue87xsd6whs8um2dyafh0rdh04
+        m:
+            - "1": train/global_step
+              "6":
+                - 3
+              "7": []
+            - "1": eval/epoch
+              "6":
+                - 3
+              "7": []
+            - "2": eval/*
+              "5": 2
+              "6":
+                - 1
+              "7": []
+            - "2": train/*
+              "5": 1
+              "6":
+                - 1
+              "7": []
+        python_version: 3.13.3
+        t:
+            "1":
+                - 1
+                - 11
+                - 49
+                - 71
+            "2":
+                - 1
+                - 11
+                - 49
+                - 71
+            "3":
+                - 2
+                - 7
+                - 13
+                - 16
+                - 66
+            "4": 3.13.3
+            "5": 0.28.1
+            "6": 5.14.1
+            "10":
+                - 20
+            "12": 0.28.1
+            "13": linux-x86_64
+logger:
+    value:
+        wandb:
+            group: null
+            key: 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
+            org: null
+            project: nano-swe-eval
+            run_name: smoke-20260724-162131

@@ -22,6 +22,12 @@ DEFAULT_SAMPLE_SIZE = 20
 DEFAULT_SEED = 42
 
 
+def docker_image_for(instance_id: str) -> str:
+    """SWE-bench publishes one prebuilt image per instance on Docker Hub under this naming rule.
+    Docker repository names must be lowercase."""
+    return f"swebench/sweb.eval.x86_64.{instance_id.replace('__', '_1776_').lower()}:latest"
+
+
 def stratified_sample_by_repo(instances: list[dict], sample_size: int, seed: int) -> list[dict]:
     """Round-robins across repos (each repo's instances pre-shuffled) so no repo dominates."""
     by_repo: dict[str, list[dict]] = defaultdict(list)
@@ -55,7 +61,8 @@ def build(output_dir: Path, sample_size: int, seed: int) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     for instance in sample:
-        write_task(instance, DATASET_NAME, output_dir / instance["instance_id"])
+        docker_image = docker_image_for(instance["instance_id"])
+        write_task(instance, DATASET_NAME, output_dir / instance["instance_id"], docker_image=docker_image)
 
     repo_counts: dict[str, int] = defaultdict(int)
     for instance in sample:

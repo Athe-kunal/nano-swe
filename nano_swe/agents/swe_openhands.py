@@ -14,7 +14,6 @@ from nano_swe.agents.base import AgentRunner, Trajectory, _first_scalar
 from nano_swe.agents.chat_proxy import ChatProxyServer
 
 DEFAULT_MAX_ITERATIONS = 30
-SANDBOX_IMAGE = "python:3.12-slim"
 
 # Per-runner (per Ray actor) concurrent-sandbox cap; total cluster concurrency is this times
 # --rollout.num_runners. Scale out via this env var and/or --rollout.num_runners.
@@ -82,5 +81,4 @@ def _run_episode_sync(task_dir: Path, base_url: str) -> dict:
         model="policy",
         max_iterations=DEFAULT_MAX_ITERATIONS,
         native_tool_calling=False,
-        image=SANDBOX_IMAGE,
     )
