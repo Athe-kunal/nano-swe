@@ -491,7 +491,7 @@ class SamplesGenerator:
                     "skipping rollout response."
                 )
                 return None, "logprob_misalign"
-            rollout_log_probs = torch.tensor(raw_rollout_log_probs[step_slice]).to("cpu")
+            rollout_log_probs = torch.as_tensor(raw_rollout_log_probs[step_slice]).to("cpu")
         else:
             rollout_log_probs = None
 

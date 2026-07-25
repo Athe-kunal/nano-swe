@@ -15,10 +15,14 @@ from pathlib import Path
 
 from daytona import CreateSandboxFromImageParams, Daytona, Sandbox
 
-TESTBED_PYTHON = "/opt/miniconda3/envs/testbed/bin/python"  # SWE-bench harness convention
+from nano_swe.harness import paths
+
 SANDBOX_CREATE_TIMEOUT = 600  # some images (e.g. PyTorch/CUDA-heavy repos) are multi-GB pulls
 
-DRIVER_PY = '''"""Runs an OpenHands agent against the task instruction. Executed inside the sandbox."""
+# f-string: interpolates paths.INSTRUCTION_PATH at build time (this process), so the file this
+# uploads and the path it reads from always agree — the escaped {{cost}} below is the one brace
+# pair that must survive into the remote script's own f-string, evaluated when it runs.
+DRIVER_PY = f'''"""Runs an OpenHands agent against the task instruction. Executed inside the sandbox."""
 
 import argparse
 import os
@@ -35,7 +39,7 @@ parser.add_argument("--max-iterations", type=int, default=30)
 parser.add_argument("--native-tool-calling", choices=["true", "false"], default="true")
 args = parser.parse_args()
 
-instruction = open("/workspace/task/instruction.md").read()
+instruction = open("{paths.INSTRUCTION_PATH}").read()
 
 llm = LLM(
     usage_id="agent",
@@ -52,7 +56,7 @@ try:
     conversation.send_message(instruction)
     conversation.run()
     cost = conversation.conversation_stats.get_combined_metrics().accumulated_cost
-    print(f"EPISODE_COST: {cost}")
+    print(f"EPISODE_COST: {{cost}}")
 finally:
     conversation.close()
 '''
@@ -104,7 +108,6 @@ def run_episode(
     if not docker_image:
         raise ValueError(f"{task_dir}/task.toml has no [environment] docker_image")
     instruction = (task_dir / "instruction.md").read_text()
-    repo_dir = "/testbed"
 
     daytona = Daytona()
     sandbox = daytona.create(CreateSandboxFromImageParams(image=docker_image), timeout=SANDBOX_CREATE_TIMEOUT)
@@ -112,36 +115,35 @@ def run_episode(
     try:
         # The image's "testbed" conda env may predate openhands-sdk's >=3.12 requirement, so the
         # agent gets its own uv-managed interpreter instead of touching the repo's env at all.
-        oh_python = "/opt/oh-venv/bin/python"
         _run(sandbox, "curl -LsSf https://astral.sh/uv/install.sh | sh")
-        _run(sandbox, "~/.local/bin/uv venv --python 3.12 /opt/oh-venv")
-        _run(sandbox, f"~/.local/bin/uv pip install --python {oh_python} openhands-sdk openhands-tools")
-        _run(sandbox, f"{TESTBED_PYTHON} -m pip install -q pytest-json-report")
+        _run(sandbox, f"~/.local/bin/uv venv --python 3.12 {paths.OH_VENV_DIR}")
+        _run(sandbox, f"~/.local/bin/uv pip install --python {paths.OH_PYTHON} openhands-sdk openhands-tools")
+        _run(sandbox, f"{paths.TESTBED_PYTHON} -m pip install -q pytest-json-report")
 
-        sandbox.fs.create_folder("/workspace/task/tests", "755")
-        sandbox.fs.upload_file(instruction.encode(), "/workspace/task/instruction.md")
-        sandbox.fs.upload_file(DRIVER_PY.encode(), "/workspace/driver.py")
-        for name in ("test_patch.diff", "instance.json", "grade.py"):
-            sandbox.fs.upload_file(str(task_dir / "tests" / name), f"/workspace/task/tests/{name}")
+        sandbox.fs.create_folder(paths.TASK_TESTS_DIR, "755")
+        sandbox.fs.upload_file(instruction.encode(), paths.INSTRUCTION_PATH)
+        sandbox.fs.upload_file(DRIVER_PY.encode(), paths.DRIVER_PATH)
+        for name in paths.TASK_TEST_FILES:
+            sandbox.fs.upload_file(str(task_dir / "tests" / name), f"{paths.TASK_TESTS_DIR}/{name}")
 
         _run(
             sandbox,
-            f"{oh_python} /workspace/driver.py --model {model} --workdir {repo_dir} "
+            f"{paths.OH_PYTHON} {paths.DRIVER_PATH} --model {model} --workdir {paths.REPO_DIR} "
             f"--max-iterations {max_iterations} "
             f"--native-tool-calling {'true' if native_tool_calling else 'false'}",
-            cwd="/workspace",
+            cwd=paths.WORKSPACE_DIR,
             timeout=900,
             env={"OPENAI_API_KEY": api_key, "OPENAI_BASE_URL": base_url},
         )
 
         _run(
             sandbox,
-            f"{TESTBED_PYTHON} /workspace/task/tests/grade.py",
-            cwd="/workspace",
+            f"{paths.TESTBED_PYTHON} {paths.TASK_TESTS_DIR}/grade.py",
+            cwd=paths.WORKSPACE_DIR,
             timeout=600,
-            env={"AGENT_WORKDIR": repo_dir},
+            env={"AGENT_WORKDIR": paths.REPO_DIR},
         )
-        reward = float(sandbox.fs.download_file("/logs/verifier/reward.txt").decode())
+        reward = float(sandbox.fs.download_file(paths.REWARD_PATH).decode())
         print(f"REWARD: {reward}")
         return {"reward": reward, "sandbox_id": sandbox.id}
     finally:

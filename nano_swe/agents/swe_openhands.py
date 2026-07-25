@@ -15,8 +15,6 @@ from nano_swe.agents.chat_proxy import ChatProxyServer
 
 DEFAULT_MAX_ITERATIONS = 30
 
-# Per-runner (per Ray actor) concurrent-sandbox cap; total cluster concurrency is this times
-# --rollout.num_runners. Scale out via this env var and/or --rollout.num_runners.
 _MAX_CONCURRENT_SANDBOXES = int(os.environ.get("SWE_HARNESS_MAX_CONCURRENT_SANDBOXES", "8"))
 
 

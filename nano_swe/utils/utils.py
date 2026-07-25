@@ -32,7 +32,7 @@ def convert_to_torch_dtype(param_dtype: str) -> torch.dtype:
 
 
 def get_strategy(args):
-    from molt.trainer.fsdp import FsdpStrategy
+    from nano_swe.trainer.fsdp import FsdpStrategy
 
     return FsdpStrategy(
         seed=getattr(args.train, "seed", 42),

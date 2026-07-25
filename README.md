@@ -52,3 +52,18 @@ MODEL_PATH=... PROMPT_DATASET=... bash nano_swe/cli/recipes/swe_gym_rl.sh --roll
 
 See the comments at the top of each recipe YAML for what it sets and known gaps (e.g. the
 prompt/SFT dataset loaders `nano_swe.datasets.*` aren't built yet).
+
+## Citation
+
+The training entrypoints under `nano_swe/cli/` and trainer under `nano_swe/trainer/` are ported
+from [Molt](https://github.com/NVIDIA-NeMo/labs-molt). If you use them, please cite:
+
+```bibtex
+@article{hu2026molt,
+  title        = {Molt: A Scalable PyTorch-Native Training Framework for Agentic Reinforcement Learning},
+  author       = {Jian Hu and Molt Contributors},
+  year         = {2026},
+  howpublished = {\url{https://github.com/NVIDIA-NeMo/labs-molt}},
+  doi          = {10.13140/RG.2.2.23375.65447}
+}
+```

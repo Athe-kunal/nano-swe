@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple
 
+import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -24,7 +25,7 @@ from starlette.requests import Request
 class _Session:
     observation_tokens: List[int] = field(default_factory=list)
     action_ranges: List[Tuple[int, int]] = field(default_factory=list)
-    rollout_log_probs: List[float] = field(default_factory=list)
+    rollout_log_probs: torch.Tensor = field(default_factory=lambda: torch.empty(0))
     truncated: bool = False
 
 
@@ -94,10 +95,12 @@ class ChatProxyServer:
             # this trajectory fresh from the re-rendered prompt.
             session.observation_tokens = []
             session.action_ranges = []
-            session.rollout_log_probs = []
+            session.rollout_log_probs = torch.empty(0)
             prev_len = 0
         session.observation_tokens.extend(prompt_token_ids[prev_len:])
-        session.rollout_log_probs.extend([0.0] * (len(session.observation_tokens) - prev_len))
+        session.rollout_log_probs = torch.cat(
+            [session.rollout_log_probs, torch.zeros(len(session.observation_tokens) - prev_len)]
+        )
 
         output, _off_policy_len = await self.llm_engine.generate(prompt_token_ids, self.sampling_params, session_id)
         gen = output.outputs[0]
@@ -105,7 +108,8 @@ class ChatProxyServer:
         action_start = len(session.observation_tokens)
         session.observation_tokens.extend(gen.token_ids)
         session.action_ranges.append((action_start, action_start + len(gen.token_ids)))
-        session.rollout_log_probs.extend(next(iter(lp.values())).logprob for lp in gen.logprobs)
+        gen_log_probs = torch.tensor([next(iter(lp.values())).logprob for lp in gen.logprobs])
+        session.rollout_log_probs = torch.cat([session.rollout_log_probs, gen_log_probs])
         if gen.finish_reason == "length":
             session.truncated = True
 
