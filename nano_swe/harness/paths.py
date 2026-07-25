@@ -20,3 +20,9 @@ OH_VENV_DIR = "/opt/oh-venv"
 OH_PYTHON = f"{OH_VENV_DIR}/bin/python"
 
 REWARD_PATH = "/logs/verifier/reward.txt"
+
+# OpenHands' own event log (Conversation(persistence_dir=...)) — the full structured trajectory
+# (every LLM call, tool action, observation). Tarred up before the sandbox is deleted so it can be
+# pulled out as a single file rather than enumerating an unknown number of per-event JSON files.
+TRAJECTORY_DIR = f"{WORKSPACE_DIR}/trajectory"
+TRAJECTORY_ARCHIVE_PATH = f"{WORKSPACE_DIR}/trajectory.tar.gz"

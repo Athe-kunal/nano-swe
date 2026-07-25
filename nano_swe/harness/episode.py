@@ -50,7 +50,12 @@ llm = LLM(
 )
 agent = get_default_agent(llm=llm, cli_mode=True)
 workspace = LocalWorkspace(working_dir=args.workdir)
-conversation = Conversation(agent=agent, workspace=workspace, max_iteration_per_run=args.max_iterations)
+conversation = Conversation(
+    agent=agent,
+    workspace=workspace,
+    max_iteration_per_run=args.max_iterations,
+    persistence_dir="{paths.TRAJECTORY_DIR}",
+)
 
 try:
     conversation.send_message(instruction)
@@ -85,6 +90,7 @@ def run_episode(
     model: str,
     max_iterations: int = 30,
     native_tool_calling: bool = True,
+    save_trajectory: bool = False,
 ) -> dict:
     """Runs one Harbor task end-to-end in a fresh Daytona sandbox.
 
@@ -98,9 +104,15 @@ def run_episode(
         native_tool_calling: Whether the endpoint understands OpenAI-style `tools=[...]` /
             `tool_calls` (True for Fireworks and most hosted APIs; False for a plain
             text-completion proxy that can't format tool_calls JSON).
+        save_trajectory: Whether to pull OpenHands' event log (every LLM call, tool action,
+            observation) out of the sandbox before it's deleted. Off by default — an RL rollout
+            has nothing to do with it yet and downloading/storing it for every rollout would be
+            wasteful; eval runs can opt in for debugging.
 
     Returns:
-        {"reward": float, "sandbox_id": str}.
+        {"reward": float, "sandbox_id": str, "trajectory": bytes | None}. "trajectory" is a
+        gzipped tar of OpenHands' persistence_dir (JSON event log), or None if not requested (or
+        if the agent never wrote one, e.g. it crashed before the first event).
     """
     toml = tomllib.loads((task_dir / "task.toml").read_text())
     task = toml["metadata"]
@@ -145,6 +157,19 @@ def run_episode(
         )
         reward = float(sandbox.fs.download_file(paths.REWARD_PATH).decode())
         print(f"REWARD: {reward}")
-        return {"reward": reward, "sandbox_id": sandbox.id}
+
+        trajectory = None
+        if save_trajectory:
+            _run(
+                sandbox,
+                f"tar czf {paths.TRAJECTORY_ARCHIVE_PATH} -C {paths.TRAJECTORY_DIR} .",
+                check=False,
+            )
+            try:
+                trajectory = sandbox.fs.download_file(paths.TRAJECTORY_ARCHIVE_PATH)
+            except Exception as e:
+                print(f"[episode] no trajectory to save: {e}")
+
+        return {"reward": reward, "sandbox_id": sandbox.id, "trajectory": trajectory}
     finally:
         sandbox.delete()

@@ -22,23 +22,37 @@ from nano_swe.utils.logging_utils import WandbLogger, init_logger
 logger = init_logger(__name__)
 
 
-def run_pass_at_k(task_dirs: list[Path], k: int, max_concurrency: int, **episode_kwargs) -> dict[str, list[float]]:
+def run_pass_at_k(
+    task_dirs: list[Path],
+    k: int,
+    max_concurrency: int,
+    trajectories_dir: Path | None = None,
+    **episode_kwargs,
+) -> dict[str, list[float]]:
     """Runs k rollouts of every task, bounded by max_concurrency concurrent sandboxes.
 
     Returns {task_id: [reward, ...]} (one entry per rollout, in completion order).
     """
     rewards_by_task: dict[str, list[float]] = {task_dir.name: [] for task_dir in task_dirs}
+    if trajectories_dir:
+        trajectories_dir.mkdir(parents=True, exist_ok=True)
 
     with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
         futures = {
-            pool.submit(run_episode, task_dir, **episode_kwargs): task_dir.name
+            pool.submit(run_episode, task_dir, save_trajectory=bool(trajectories_dir), **episode_kwargs): (
+                task_dir.name
+            )
             for task_dir in task_dirs
             for _ in range(k)
         }
         for future in as_completed(futures):
             task_id = futures[future]
             try:
-                reward = future.result()["reward"]
+                result = future.result()
+                reward = result["reward"]
+                if trajectories_dir and result.get("trajectory"):
+                    rollout_idx = len(rewards_by_task[task_id])
+                    (trajectories_dir / f"{task_id}.{rollout_idx}.tar.gz").write_bytes(result["trajectory"])
             except Exception as e:
                 logger.warning(f"{task_id}: rollout failed ({e})")
                 reward = 0.0
@@ -72,6 +86,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="Only evaluate the first N tasks.")
     parser.add_argument("--max-iterations", type=int, default=30)
     parser.add_argument("--max-concurrency", type=int, default=8, help="Concurrent Daytona sandboxes.")
+    parser.add_argument(
+        "--save-trajectories-dir",
+        type=Path,
+        default=None,
+        help="If set, save each rollout's OpenHands event log there as <task_id>.<rollout>.tar.gz.",
+    )
     parser.add_argument("--wandb-project", default="nano-swe-eval")
     parser.add_argument("--wandb-run-name", required=True)
     parser.add_argument("--wandb-org", default=None)
@@ -89,6 +109,7 @@ def main() -> None:
         task_dirs,
         k=args.k,
         max_concurrency=args.max_concurrency,
+        trajectories_dir=args.save_trajectories_dir,
         base_url=args.base_url or os.environ["OPENAI_BASE_URL"],
         api_key=args.api_key or os.environ["OPENAI_API_KEY"],
         model=args.model,

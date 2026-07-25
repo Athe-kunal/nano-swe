@@ -5,58 +5,218 @@
 # Any key here can still be overridden on the command line, e.g.
 #   ... --config nano_swe/cli/recipes/swe_gym_rl.yaml --rollout.n_samples_per_prompt 8
 #
+# Every key below is a real flag in nano_swe/cli/train_rl_ray.py (+ nano_swe/cli/common_args.py) —
+# this file is a complete, literal picture of the CLI surface, not just the handful of values a
+# "quick start" needs. Every value is that flag's own CLI default EXCEPT the ones marked
+# "(required)" (no valid default exists) or "(recipe choice)" (the bare default won't run at all,
+# or is a name/path naturally scoped to this recipe). See each flag's --help text for details.
+#
 # KNOWN GAP: data.prompt_dataset must resolve through nano_swe.datasets.PromptDataset /
 # blending_datasets, which don't exist yet — this recipe assumes a JSONL manifest with one
 # {"input": "<harbor task dir>"} row per SWE-Gym task (see nano_swe/swe_data/build_dataset.py
 # for the task dirs themselves); building that manifest + loader is the next piece.
 
-actor:
-  model_name_or_path: null # required — set via MODEL_PATH (see swe_gym_rl.sh) or edit here
-  num_nodes: 1
-  num_gpus_per_node: 8
-
-data:
-  prompt_dataset: null # required — path to the prompt manifest described above
-  input_key: input
-  max_len: 8192
-
-train:
-  agent_path: "nano_swe.agents.swe_openhands:OpenHandsSWERunner"
-  batch_size: 32
-  micro_batch_size: 1
-  max_epochs: 1
-
-rollout:
-  batch_size: 32
-  n_samples_per_prompt: 4
-  num_runners: 4
-  temperature: 1.0
-  top_p: 1.0
-
-vllm:
-  num_engines: 1
-  tensor_parallel_size: 1
-  pipeline_parallel_size: 1
-  data_parallel_size: 1 # raises EP past tensor_parallel_size (EP = TP * DP); needs enable_expert_parallel
-  enable_expert_parallel: false
-  decode_context_parallel_size: 1 # shards KV cache across decode workers for long contexts
-
-algo:
-  advantage:
-    estimator: grpo
-  kl:
-    init_coef: 0.0
-
+# FSDP2 / AutoModel backend (identical surface for SFT + RL).
 fsdp:
-  attn_implementation: sdpa
   tp_size: 1 # tensor parallel
   cp_size: 1 # context parallel (long sequences)
   ep_size: 1 # expert parallel (MoE models)
   pp_size: 1 # pipeline parallel (not yet supported by nano_swe trainers — must stay 1)
+  sequence_parallel: false
+  offload: none # none | optimizer | full — CPU-offload level (nested progression, see --help)
+  param_dtype: bf16 # bf16 | fp16
+  attn_implementation: flash_attention_2 # sdpa | eager | flex | te | flash_attention_2
+  packing_samples: false
 
+# Resumable-checkpoint retention + final HF export.
 ckpt:
-  output_dir: ./ckpt/swe_gym_rl
+  output_dir: ./ckpt
+  save_steps: -1 # -1 disables periodic resumable checkpoints
+  save_hf: false
+  disable_final_save: false
+  path: ./ckpt/checkpoints_rl_ray
+  max_num: 3
+  dcp_max_num: null # unset -> falls back to max_num
+  max_mem: .inf # GB budget for retained checkpoints
+  load_enable: false
+  best_metric_key: "" # empty = auto-detect first pass1 eval metric; "none" disables best-ckpt
+  warm_resume_rollouts: false
 
+# wandb + TensorBoard sinks and logging cadence.
 logger:
+  logging_steps: 1
   wandb:
-    project: nano-swe-rl
+    key: null
+    org: null
+    group: null
+    project: nano-swe-rl # (recipe choice) CLI default is "molt_train_rl"
+    run_name: null # unset -> "rl_<timestamp>"; override per run
+  tensorboard_dir: null
+
+# Actor (policy) model + its optimizer/scheduler.
+actor:
+  model_name_or_path: null # (required) set via MODEL_PATH (see swe_gym_rl.sh) or edit here
+  num_nodes: 1
+  num_gpus_per_node: 8
+  gradient_checkpoint: full # full | selective | none
+  aux_loss_coef: 0 # MoE balancing loss
+  freezing_steps: 0 # critic warmup: freeze actor for N steps (gae only)
+  freeze_visual_encoder: false
+  freeze_moe_router: false
+  eps_clip_low_high: null # unset -> (0.2, 0.2) symmetric PPO clip, filled in by the CLI
+  dual_clip: null
+  loss_mode: ppo # ppo | cispo
+  entropy_coef: null # any nonzero enables entropy computation/logging
+  optim: adam # adam | muon
+  muon:
+    lr: 0.02
+    momentum: 0.95
+    weight_decay: null
+    ns_steps: 5
+    nesterov: true
+  adam:
+    lr: 1.0e-6
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    weight_decay: 0.0
+  lr_scheduler: constant
+  lr_warmup_ratio: 0.03
+  min_lr_ratio: 0.1
+  max_norm: 1.0 # gradient clipping
+
+# Reference/teacher model (KL-to-init RL, or the on_policy_distill teacher).
+ref:
+  model_name_or_path: null # defaults to actor.model_name_or_path if unset
+  num_nodes: 1
+  num_gpus_per_node: 8
+
+# PPO critic (value model; used only when algo.advantage.estimator: gae).
+critic:
+  model_name_or_path: null # defaults to actor checkpoint
+  value_clip: 0.2
+  freeze_moe_router: false
+  max_epochs: null # defaults to train.max_epochs
+  optim: adam
+  muon:
+    lr: 0.02
+    momentum: 0.95
+    weight_decay: null
+    ns_steps: 5
+    nesterov: true
+  adam:
+    lr: 5.0e-6
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    weight_decay: 0.0
+  lr_scheduler: constant
+  lr_warmup_ratio: 0.03
+  min_lr_ratio: 0.1
+  max_norm: 1.0
+
+data:
+  prompt_dataset: null # (required) path to the prompt manifest described above
+  prompt_probs: null # sampling probs across blended datasets
+  prompt_split: train
+  max_samples: 100000000
+  max_len: 2048 # shared total-context budget (prompt + generation); also vLLM's max_model_len —
+  # (recipe choice) agentic multi-turn rollouts will likely need this raised well above the CLI default
+  input_key: input
+  label_key: null # dataset column holding the ground-truth answer/label for reward scoring
+  tools_key: null # dataset key with OpenAI function-call schemas, rendered into the chat template
+  apply_chat_template: false
+  image_key: images
+  max_images_per_prompt: 0 # 0 = text-only
+  disable_fast_tokenizer: false
+  dataloader_num_workers: 0
+
+algo:
+  advantage:
+    estimator: reinforce # reinforce | rloo | reinforce_baseline | grpo | dr_grpo | on_policy_distill | gae
+    gamma: 1 # discount factor
+    lam: 1.0 # GAE lambda (PPO only)
+    no_whiten: false # skip cross-batch advantage whitening
+    is_correction_level: off # off | token | seq | geo — train/rollout logprob-mismatch correction
+    is_correction_mode: mask # mask | clip | trunc
+    is_correction_threshold: [0.5, 5.0]
+  kl:
+    use_loss: false
+    estimator: k1 # k1 | k2 | k3
+    init_coef: null # unset -> 0.01 (KL-to-init) or 1.0 (on_policy_distill), filled in by the CLI
+    target: null # set for adaptive-KL control; unset = fixed coefficient
+    horizon: 10000
+  dynamic_filtering_enable: false
+  dynamic_filtering_range: [0, 1]
+
+reward:
+  clip_range: [-10, 10]
+
+train:
+  agent_path: "nano_swe.agents.swe_openhands:OpenHandsSWERunner" # (required) CLI default is null
+  batch_size: 128
+  micro_batch_size: 1
+  max_tokens_per_gpu: 16192
+  max_epochs: 1
+  num_episodes: 1
+  seed: 42
+  full_determinism_enable: false
+  dynamic_batch_enable: false
+  force_on_policy: false
+  colocate_fsdp_models: false
+  async_queue_size: 1
+  partial_rollout_enable: false
+  force_sync_mode: false
+  routing_replay: false # R3: replay vLLM's per-token expert selection in the training forward
+  rollout_dump_dir: null
+  rollout_replay_dir: null
+  check_weight_update_equal: false
+
+vllm:
+  num_engines: 1 # (required) CLI default is null, which raises immediately ("RL rollout requires vLLM")
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  data_parallel_size: 1 # raises EP past tensor_parallel_size (EP = TP * DP); needs enable_expert_parallel
+  sync_backend: nccl
+  enforce_eager: false
+  router_policy: consistent_hash
+  mtp_num_speculative_tokens: 0 # >0 enables MTP speculative decoding (rollout-only, lossless)
+  dtype: bfloat16
+  gpu_memory_utilization: 0.95
+  mm_encoder_attn_backend: null
+  gdn_prefill_backend: null # flashinfer | triton
+  attention_backend: null # FLASH_ATTN | FLASHINFER | TRITON_ATTN | FLEX_ATTENTION
+  block_size: null # KV cache block size (tokens); MiniMax-M3 MSA needs 128
+  mamba_ssm_cache_dtype: null # auto | float32 | float16
+  distributed_executor_backend: null # ray | mp | uni
+  enable_expert_parallel: false
+  disable_custom_all_reduce: false
+  enable_prefix_caching: false
+  enable_chunked_prefill: null # unset = vLLM auto
+  max_num_batched_tokens: null # unset = vLLM auto
+  async_scheduling: null # unset = vLLM auto
+  decode_context_parallel_size: 1 # shards KV cache across decode workers for long contexts
+
+rollout:
+  batch_size: 1024
+  num_runners: 2 # AgentRunnerActor pool size; prompts round-robin across them
+  vllm_generate_batch_size: null # unset -> rollout.batch_size
+  micro_batch_size: 1
+  max_new_tokens: null # unset -> dynamically computed as max_len - prompt_len per sample
+  max_tokens_per_gpu: null
+  n_samples_per_prompt: 1 # must be > 1 for grpo/rloo/reinforce_baseline/dr_grpo (reinforce/gae don't need it)
+  top_p: 1.0
+  temperature: 1.0
+
+eval:
+  dataset: null
+  split: train
+  steps: -1 # -1 disables periodic eval
+  temperature: null # unset -> falls back to rollout.temperature
+  top_p: null # unset -> falls back to rollout.top_p
+  max_new_tokens: null # unset -> falls back to rollout.max_new_tokens
+  n_samples_per_prompt: null # unset -> falls back to rollout.n_samples_per_prompt
+  eval_at_start: false
+  eval_only: false
+
+# Runtime / misc (top-level, not namespaced by the CLI).
+local_rank: -1 # set by torchrun; not meant to be edited here
+use_ms: false # resolve models from ModelScope hub instead of HF
