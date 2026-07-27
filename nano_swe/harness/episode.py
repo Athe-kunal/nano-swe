@@ -19,9 +19,6 @@ from nano_swe.harness import paths
 
 SANDBOX_CREATE_TIMEOUT = 600  # some images (e.g. PyTorch/CUDA-heavy repos) are multi-GB pulls
 
-# f-string: interpolates paths.INSTRUCTION_PATH at build time (this process), so the file this
-# uploads and the path it reads from always agree — the escaped {{cost}} below is the one brace
-# pair that must survive into the remote script's own f-string, evaluated when it runs.
 DRIVER_PY = f'''"""Runs an OpenHands agent against the task instruction. Executed inside the sandbox."""
 
 import argparse
