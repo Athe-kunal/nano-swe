@@ -148,17 +148,25 @@ class ReferenceModelActor(BaseModelActor):
 
     def forward(self, experience) -> torch.Tensor:
         """Reference log-probs for one rollout Experience. reload() first fetches the sample's heavy
-        tensors (token ids) from the producing runner's shared-memory store — they reach
+        tensors (token ids / images) from the producing runner's shared-memory store — they reach
         this rank straight from the runner, never through the controller. Called per sample by
         execute_batch; the controller attaches the result as base_action_log_probs."""
         experience = experience.reload()
         device = torch.cuda.current_device()
+
+        # VLM: merge pre-processed multimodal inputs.
+        mm_inputs = {}
+        if experience.mm_train_inputs and getattr(self.model, "is_vlm", False):
+            from nano_swe.utils.vlm_utils import merge_mm_train_inputs
+
+            mm_inputs = merge_mm_train_inputs(experience.mm_train_inputs, device)
 
         with torch.no_grad():
             output = self.model(
                 experience.sequences.to(device),
                 experience.action_mask.to(device),
                 experience.attention_mask.to(device),
+                **mm_inputs,
             )
         return output["action_log_probs"].to("cpu")
 

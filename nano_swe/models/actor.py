@@ -31,7 +31,7 @@ class Actor(BaseModel):
     """Policy model wrapper for RLHF.
 
     Reuses ``BaseModel`` for construction and the shared ``_forward_backbone``
-    (packing / CP prep + model call); ``forward`` turns the model logits into
+    (packing / VLM / CP prep + model call); ``forward`` turns the model logits into
     per-token log-probs, optionally entropy, and the action-span log-probs.
     """
 

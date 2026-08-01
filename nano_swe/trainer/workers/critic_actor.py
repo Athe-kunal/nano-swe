@@ -47,6 +47,7 @@ from nano_swe.trainer.fsdp import FsdpStrategy
 from nano_swe.utils import get_tokenizer
 from nano_swe.utils.distributed_util import torch_dist_barrier_and_cuda_sync
 from nano_swe.utils.logging_utils import init_logger
+from nano_swe.utils.vlm_utils import merge_mm_train_inputs
 
 from ..algorithm import NaiveReplayBuffer
 from .actor_group import BaseModelActor
@@ -194,6 +195,10 @@ class CriticTrainer:
     def training_step(self, experience: Experience, batch_num_tokens, is_optimizer_step: bool):
         self.critic.train()
 
+        multimodal_inputs = {}
+        if experience.mm_train_inputs and getattr(self.critic, "is_vlm", False):
+            multimodal_inputs = merge_mm_train_inputs(experience.mm_train_inputs, experience.sequences.device)
+
         cp_context_stack = ExitStack()
         try:
             output = self.critic(
@@ -201,6 +206,7 @@ class CriticTrainer:
                 experience.action_mask,
                 attention_mask=experience.attention_mask,
                 cp_context_stack=cp_context_stack,
+                **multimodal_inputs,
             )
             value_loss, reported_value_loss, value_clip_frac = self.value_loss_fn(
                 output["action_values"],
@@ -263,10 +269,10 @@ class CriticModelActor(BaseModelActor):
             activation_checkpointing=args.actor.gradient_checkpoint,
             packing_samples=args.fsdp.packing_samples,
             temperature=args.rollout.temperature,
+            freeze_visual_encoder=getattr(args.actor, "freeze_visual_encoder", False),
             # Critic router freeze: its own --critic.freeze_moe_router, or inherit the actor's flag.
             freeze_moe_router=getattr(args.critic, "freeze_moe_router", False)
             or getattr(args.actor, "freeze_moe_router", False),
-            freeze_attention=getattr(args.critic, "freeze_attention", False),
             moe_aux_loss_coef=args.actor.aux_loss_coef,
         )
         strategy.print(critic)
@@ -280,16 +286,16 @@ class CriticModelActor(BaseModelActor):
         # Independent critic optimizer / scheduler / grad-clip — the full --critic.*
         # group (add_optimizer_args(prefix="critic.")), so the value model can use its
         # own optimizer kind and LR (PPO critics often want a higher LR than the policy).
-        critic_cfg = dict(
-            optim=args.critic.optim,
-            muon=vars(args.critic.muon),
-            adam=vars(args.critic.adam),
-            lr_scheduler=args.critic.lr_scheduler,
-            lr_warmup_ratio=args.critic.lr_warmup_ratio,
-            min_lr_ratio=args.critic.min_lr_ratio,
-            max_norm=args.critic.max_norm,
-            scheduler_steps=max_steps,
-        )
+        critic_cfg = {
+            "optim": args.critic.optim,
+            "muon": vars(args.critic.muon),
+            "adam": vars(args.critic.adam),
+            "lr_scheduler": args.critic.lr_scheduler,
+            "lr_warmup_ratio": args.critic.lr_warmup_ratio,
+            "min_lr_ratio": args.critic.min_lr_ratio,
+            "max_norm": args.critic.max_norm,
+            "scheduler_steps": max_steps,
+        }
         self.critic, self.critic_optim, self.critic_scheduler = strategy.prepare((critic, critic_cfg))
 
         self.checkpoint_states = {}
@@ -330,12 +336,17 @@ class CriticModelActor(BaseModelActor):
         experience = experience.reload()
         device = torch.cuda.current_device()
 
+        mm_inputs = {}
+        if experience.mm_train_inputs and getattr(self.critic, "is_vlm", False):
+            mm_inputs = merge_mm_train_inputs(experience.mm_train_inputs, device)
+
         self.critic.eval()
         with torch.no_grad():
             output = self.critic(
                 experience.sequences.to(device),
                 experience.action_mask.to(device),
                 experience.attention_mask.to(device),
+                **mm_inputs,
             )
         self.critic.train()  # reset model state
         return output["action_values"].to("cpu")

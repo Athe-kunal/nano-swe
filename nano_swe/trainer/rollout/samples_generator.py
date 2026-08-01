@@ -63,21 +63,22 @@ def _collect_prompt_batch(dataloader_iter, num_prompts: int):
     collecting the returned prompts. Callers should still process any partial
     batch that was collected before exhaustion.
     """
-    prompts, labels, tools = [], [], []
+    prompts, labels, images, tools = [], [], [], []
     exhausted = False
 
     while len(prompts) < num_prompts:
         try:
-            _, batch_prompts, batch_labels, _batch_images, batch_tools = next(dataloader_iter)
+            _, batch_prompts, batch_labels, batch_images, batch_tools = next(dataloader_iter)
             remaining = num_prompts - len(prompts)
             prompts.extend(batch_prompts[:remaining])
             labels.extend(batch_labels[:remaining])
+            images.extend(batch_images[:remaining])
             tools.extend(batch_tools[:remaining])
         except StopIteration:
             exhausted = True
             break
 
-    return prompts, labels, tools, exhausted
+    return prompts, labels, images, tools, exhausted
 
 
 def _sample_group_key(sample) -> int | str:
@@ -124,7 +125,7 @@ class SamplesGenerator:
         if not getattr(self.args.ckpt, "warm_resume_rollouts", False) or not finished:
             return {}
         try:
-            # The rollout is held as lazy Experiences whose heavy tensors (token ids /
+            # The rollout is held as lazy Experiences whose heavy tensors (token ids / images /
             # routing) live in the runners' object stores (Experience.heavy_ref); those refs die
             # when the runners restart, so persisting the ref would seed a resumed run with dead
             # handles. Materialize a LOCAL copy of each untrained group instead — copy + reload
@@ -212,6 +213,7 @@ class SamplesGenerator:
 
         prompts_dispatched = 0
         groups_accepted = 0
+        groups_completed = 0
         drop_counts: Dict[str, int] = defaultdict(int)
         score_stats: Dict[str, float] = defaultdict(float)  # pre-DAPO-filter score stats
         progress = tqdm(
@@ -222,13 +224,13 @@ class SamplesGenerator:
             # Refill so the runner pool keeps `inflight_capacity` rollouts in flight (engines stay saturated).
             free_slots = inflight_capacity - len(self._inflight_rollouts)
             if free_slots > 0 and self._dataloader_iter is not None:
-                prompts, labels, tools, dataloader_exhausted = _collect_prompt_batch(
+                prompts, labels, images, tools, dataloader_exhausted = _collect_prompt_batch(
                     self._dataloader_iter, free_slots
                 )
                 prompts_dispatched += len(prompts)
                 if prompts:
                     self._inflight_rollouts.extend(
-                        self._dispatch_to_agent_runners(prompts, labels, tools=tools, **generate_kwargs)
+                        self._dispatch_to_agent_runners(prompts, labels, images=images, tools=tools, **generate_kwargs)
                     )
                 if dataloader_exhausted:
                     self._dataloader_iter = None
@@ -240,6 +242,7 @@ class SamplesGenerator:
             # Take the first rollout to finish; the slow ones keep generating in vLLM.
             ready, self._inflight_rollouts = ray.wait(self._inflight_rollouts, num_returns=1)
             for finished_rollout in ready:
+                groups_completed += 1
                 # Dropped groups (filtered or all-unusable) come back empty; their
                 # slot is refilled with a fresh prompt on the next iteration.
                 group_samples = self._filter_group(
@@ -255,8 +258,8 @@ class SamplesGenerator:
         rollout_metrics = {f"rollout/dropped/{reason}": float(n) for reason, n in drop_counts.items()}
         if drop_counts:
             rollout_metrics["rollout/dropped/total"] = float(sum(drop_counts.values()))
-        if dynamic_filtering and prompts_dispatched:
-            rollout_metrics["dynamic_filtering_pass_rate"] = groups_accepted / prompts_dispatched * 100
+        if dynamic_filtering and groups_completed:
+            rollout_metrics["dynamic_filtering_pass_rate"] = groups_accepted / groups_completed * 100
         # Pre-filter stats: the model's TRUE judge pass rate over ALL scored rollouts, BEFORE DAPO
         # drops uniform groups. (post-filter `reward`/`pivotrl_correct` only covers kept MIXED groups
         # ~0.5-0.65 by construction, so it hides the real pass rate + the all-pass saturation.)
@@ -350,7 +353,7 @@ class SamplesGenerator:
                     score_stats["all_pass"] += float(gmean >= max_score)
                     score_stats["all_fail"] += float(gmean <= min_score)
             # Require COMPLETE groups: a group that lost a response to a per-response drop
-            # (no_action_tokens / logprob_misalign / ...) has < n_samples
+            # (vlm_truncation / no_action_tokens / logprob_misalign / ...) has < n_samples
             # usable samples, which would pull the accepted count off train_batch_size and make
             # it indivisible by the DP-rank count -> per-sample forward microbatches split unevenly
             # -> NCCL collective desync/hang. Drop+backfill the whole group so each accepted group
@@ -378,12 +381,12 @@ class SamplesGenerator:
         accepted_experiences: List[Experience] = []
         drop_counts: Dict[str, int] = defaultdict(int)
 
-        prompts, labels, tools, exhausted = _collect_prompt_batch(dataloader_iter, num_prompts)
+        prompts, labels, images, tools, exhausted = _collect_prompt_batch(dataloader_iter, num_prompts)
         if not prompts:
             return [], prompts_consumed, True
 
         target_num_prompts = len(prompts)
-        pending_refs = self._dispatch_to_agent_runners(prompts, labels, tools=tools, **generate_kwargs)
+        pending_refs = self._dispatch_to_agent_runners(prompts, labels, images=images, tools=tools, **generate_kwargs)
         prompts_consumed += target_num_prompts
 
         pbar = tqdm(range(target_num_prompts), desc="Generate samples")
@@ -407,11 +410,13 @@ class SamplesGenerator:
                     # already-generated valid experiences (and an accurate
                     # prompts_consumed count) instead of discarding work at the
                     # dataloader boundary.
-                    new_prompts, new_labels, new_tools, exhausted = _collect_prompt_batch(dataloader_iter, 1)
+                    new_prompts, new_labels, new_images, new_tools, exhausted = _collect_prompt_batch(
+                        dataloader_iter, 1
+                    )
                     prompts_consumed += len(new_prompts)
                     if new_prompts:
                         new_refs = self._dispatch_to_agent_runners(
-                            new_prompts, new_labels, tools=new_tools, **generate_kwargs
+                            new_prompts, new_labels, images=new_images, tools=new_tools, **generate_kwargs
                         )
                         pending_refs.extend(new_refs)
 
@@ -420,7 +425,7 @@ class SamplesGenerator:
         return accepted_experiences, prompts_consumed, exhausted
 
     def _dispatch_to_agent_runners(
-        self, prompts: List[str], labels: List[str], *, tools: List = None, **generate_kwargs
+        self, prompts: List[str], labels: List[str], *, images: List = None, tools: List = None, **generate_kwargs
     ) -> List:
         """Round-robin each prompt group onto the runner actors; each ``run_group`` returns a
         Ray ref of that group's Trajectories, consumed by the streaming loop / filtering /
@@ -436,27 +441,31 @@ class SamplesGenerator:
         )
         truncate_length = generate_kwargs.get("max_len", 2048)
         n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
+        if images is None:
+            images = [None] * len(prompts)
         if tools is None:
             tools = [None] * len(prompts)
 
         refs = []
-        for prompt, label, tool in zip(prompts, labels, tools):
+        for prompt, label, img, tool in zip(prompts, labels, images, tools):
             actor = self.agent_runners[self._rr % len(self.agent_runners)]
             self._rr += 1
             refs.append(
-                actor.run_group.remote(prompt, label, sampling_params, truncate_length, n_samples, tools=tool)
+                actor.run_group.remote(prompt, label, img, sampling_params, truncate_length, n_samples, tools=tool)
             )
         return refs
 
     @staticmethod
-    def _process_response_into_experience(response, truncate_length) -> Tuple[Optional[Experience], Optional[str]]:
+    def _process_response_into_experience(
+        response, media_ids, truncate_length
+    ) -> Tuple[Optional[Experience], Optional[str]]:
         """Turn one Trajectory (from agent Runner) into an Experience.
 
         Runs on the producing runner (AgentRunnerActor), not the controller, so the heavy tensors
-        (token ids / rollout routing) are built where they are generated. Returns
+        (image pixel_values / token ids / rollout routing) are built where they are generated. Returns
         ``(experience, None)`` when the rollout is usable, or ``(None, drop_reason)`` when it must be
-        dropped — the reason is a short code (e.g. ``"no_action_tokens"``) the generator tallies into
-        the ``rollout/dropped/<reason>`` metrics.
+        dropped — the reason is a short code (e.g. ``"vlm_truncation"``, ``"no_action_tokens"``) the
+        generator tallies into the ``rollout/dropped/<reason>`` metrics.
         """
         step_slice = slice(1, truncate_length)
 
@@ -464,6 +473,28 @@ class SamplesGenerator:
         if not trajectory_tokens:
             logger.warning("Skipping rollout response with empty observation_tokens.")
             return None, "empty_tokens"
+
+        # VLM safety: the truncation below cuts the token sequence at `truncate_length` but
+        # mm_train_inputs (pixel_values / image_grid_thw) stays full-size. If truncation removes any
+        # image/video placeholder token, the actor's vit-embed scatter misaligns with the pixel_values
+        # rows — a SILENT train/rollout policy mismatch. Drop such rollouts instead of training on it.
+        if response.mm_train_inputs is not None and len(trajectory_tokens) > truncate_length:
+            dropped_media = (
+                sum(1 for t in trajectory_tokens[truncate_length:] if t in media_ids) if media_ids else None
+            )
+            if dropped_media is None:
+                logger.warning(
+                    "Skipping VLM rollout: trajectory exceeds max_len and image token ids could not be "
+                    "resolved to verify truncation safety. Increase --max_len / --max_new_tokens."
+                )
+                return None, "vlm_media_unresolved"
+            if dropped_media:
+                logger.warning(
+                    f"Skipping VLM rollout: truncation at max_len={truncate_length} would drop {dropped_media} "
+                    "image/video placeholder token(s) while pixel_values stays full-size (vit-embed "
+                    "misalignment). Increase --max_len or --max_new_tokens."
+                )
+                return None, "vlm_truncation"
 
         reward_val = _to_scalar(response.reward)
         score_val = _to_scalar(response.scores)
@@ -491,7 +522,7 @@ class SamplesGenerator:
                     "skipping rollout response."
                 )
                 return None, "logprob_misalign"
-            rollout_log_probs = torch.as_tensor(raw_rollout_log_probs[step_slice]).to("cpu")
+            rollout_log_probs = torch.tensor(raw_rollout_log_probs[step_slice]).to("cpu")
         else:
             rollout_log_probs = None
 
@@ -504,6 +535,13 @@ class SamplesGenerator:
         is_clipped = total_length >= truncate_length
 
         info = {"response_clip_ratio": torch.tensor([is_clipped])}
+        if response.mm_train_inputs is not None and media_ids:
+            # Embedded image tokens that actually enter training. An image silently dropped or rendered
+            # at reduced resolution shrinks this count while reward/vllm_kl stay plausible — the one
+            # visible trace of an image-blind rollout.
+            info["image_tokens"] = torch.tensor(
+                [sum(1 for t in trajectory_tokens[:truncate_length] if t in media_ids)]
+            )
         if reward_val is not None:
             info["reward"] = torch.tensor([reward_val])
         if score_val is not None:
@@ -522,8 +560,8 @@ class SamplesGenerator:
         if response.routed_experts is not None:
             row_shape = next((r.shape for r in response.routed_experts if r is not None), None)
             if row_shape is not None:
-                # Positions with no captured rollout routing (feedback, the trailing token) get a
-                # -1 sentinel: the training forward keeps its
+                # Positions with no captured rollout routing (a multimodal prompt the engine didn't
+                # route, feedback, the trailing token) get a -1 sentinel: the training forward keeps its
                 # own natural routing there (RouterReplay). Zeros would instead force those tokens to
                 # expert 0 and corrupt the forward.
                 sentinel = np.full(row_shape, -1, dtype=np.int16)
@@ -542,6 +580,8 @@ class SamplesGenerator:
             routed_experts=routed_experts,
             prompts=[response.prompt],
             labels=[response.label],
+            images=[response.images],
+            mm_train_inputs=[response.mm_train_inputs],
             group_ids=[response.group_id] if response.group_id is not None else [],
             rollout_ids=[response.rollout_id] if response.rollout_id is not None else [],
             rewards=torch.tensor([reward_val]) if reward_val is not None else None,

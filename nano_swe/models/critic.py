@@ -16,7 +16,7 @@
 """Value model (critic) for PPO.
 
 Shares the actor's entire construction and forward machinery via ``BaseModel``
-(FSDP2 / TP / EP / CP, packing, dtype) and differs only in the final
+(FSDP2 / TP / EP / CP, packing, VLM prep, dtype) and differs only in the final
 projection: the vocabulary head is replaced by a scalar value head, so the model
 emits one V(s) per token instead of logits. AutoModel custom MoE forwards return a
 raw ``head(hidden)`` tensor and do not surface hidden states, so making the head
@@ -70,9 +70,9 @@ class _ValueHead(nn.Module):
 
 def _resolve_hidden_size(model) -> int:
     """Hidden size for the value head, read off the built model rather than its config —
-    config-independent, so it sidesteps where (and how) each architecture nests the
-    language-model dims (``text_config``, ``llm_config`` for Nemotron-Omni, dict vs
-    object; several of our models expose no top-level ``hidden_size`` at all).
+    config-independent, so it sidesteps where (and how) VLMs nest the language-model dims
+    (``text_config``, ``llm_config`` for Nemotron-Omni, dict vs object; several of our
+    models expose no top-level ``hidden_size`` at all).
 
     Primary source is the ``lm_head`` we're about to replace: its ``in_features`` is
     exactly the post-norm hidden the value head consumes — correct even under a factorized
@@ -122,11 +122,11 @@ class Critic(BaseModel):
         # checkpointer saves lm_head as its own tensor (a tied head is deduplicated
         # against the embeddings and would be dropped from the critic checkpoint),
         # and so nothing later re-ties the [1, hidden] head to the [vocab, hidden]
-        # embeddings. Set it on the text sub-config too for nested models.
+        # embeddings. Set it on the text sub-config too for nested VLM models.
         for cfg in (self.model.config, getattr(self.model.config, "text_config", None)):
             if cfg is not None and getattr(cfg, "tie_word_embeddings", False):
                 cfg.tie_word_embeddings = False
-        # set_output_embeddings routes to the real head even for nested models
+        # set_output_embeddings routes to the real head even for nested VLM models
         # (e.g. language_model.lm_head); fall back to a direct attribute otherwise.
         if hasattr(self.model, "set_output_embeddings"):
             self.model.set_output_embeddings(value_head)

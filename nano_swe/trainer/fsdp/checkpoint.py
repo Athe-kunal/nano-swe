@@ -23,6 +23,7 @@ retention/pruning. It holds a back-reference to the owning strategy for model
 unwrapping, rank/mesh info, and rank-0 logging.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -155,10 +156,8 @@ class CheckpointManager:
 
     def _write_ckpt_metric(self, ckpt_dir: str, metric_value, metric_key=None) -> None:
         if hasattr(metric_value, "item"):  # torch / numpy scalar -> python float
-            try:
+            with contextlib.suppress(Exception):
                 metric_value = metric_value.item()
-            except Exception:
-                pass
         path = self._get_ckpt_metric_path(ckpt_dir)
         self._atomic_write_json(path, {"metric_key": metric_key, "metric_value": metric_value})
 
@@ -180,10 +179,8 @@ class CheckpointManager:
         total = 0
         for dirpath, _, filenames in os.walk(path):
             for filename in filenames:
-                try:
+                with contextlib.suppress(OSError):
                     total += os.path.getsize(os.path.join(dirpath, filename))
-                except OSError:
-                    pass
         return total
 
     @staticmethod
@@ -290,6 +287,15 @@ class CheckpointManager:
                 ),
             )
             if not candidates:
+                # regular_subdirs is exhausted (only current_tag/best* dirs remain, both
+                # protected from eviction) but max_mem is still over budget: warn instead of
+                # silently leaving the checkpoint dir over budget forever.
+                if overflow_mem:
+                    self.strategy.print(
+                        f"Warning: checkpoint dir {ckpt_path} exceeds --ckpt.max_mem "
+                        f"({max_mem}GB), but only protected current/best checkpoints "
+                        "remain; nothing can be evicted."
+                    )
                 break
             shutil.rmtree(candidates[0][0], ignore_errors=True)
 

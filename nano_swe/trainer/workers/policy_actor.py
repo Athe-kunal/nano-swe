@@ -38,11 +38,23 @@ from nano_swe.trainer.fsdp.refit import gather_full_param
 from nano_swe.utils import get_tokenizer
 from nano_swe.utils.distributed_util import stateless_init_process_group, torch_dist_barrier_and_cuda_sync
 from nano_swe.utils.logging_utils import init_logger
+from nano_swe.utils.vlm_utils import merge_mm_train_inputs
 
 from ..algorithm import NaiveReplayBuffer
 from .actor_group import BaseModelActor
 
 logger = init_logger(__name__)
+
+
+def _skip_tied_lm_head(config, name: str) -> bool:
+    """Whether to skip broadcasting this weight to vLLM as a redundant tied lm_head.
+
+    Tied-embedding models share lm_head with embed_tokens; vLLM receives the shared
+    weight through embed_tokens, so a separate lm_head.weight update is redundant and
+    would form an empty "loaded 0 of N" refit batch. Exact-match only (``lm_head.weight``)
+    so nested/auxiliary heads like ``mtp.lm_head.weight`` are still sent.
+    """
+    return bool(getattr(config, "tie_word_embeddings", False)) and name == "lm_head.weight"
 
 
 class PolicyTrainer:
@@ -89,7 +101,7 @@ class PolicyTrainer:
             clip_eps_low=self.args.actor.eps_clip_low_high[0],
             clip_eps_high=self.args.actor.eps_clip_low_high[1],
             dual_clip=self.args.actor.dual_clip,
-            loss_mode="sao" if self.args.algo.sao else self.args.actor.loss_mode,
+            loss_mode=self.args.actor.loss_mode,
             is_correction_level=self.args.algo.advantage.is_correction_level,
             is_correction_mode=self.args.algo.advantage.is_correction_mode,
             is_correction_threshold=(
@@ -155,7 +167,7 @@ class PolicyTrainer:
         engine_world = vllm_tensor_parallel_size * vllm_pipeline_parallel_size * vllm_data_parallel_size
         world_size = vllm_num_engines * engine_world + 1
 
-        group_name = "nano_swe"
+        group_name = "molt"
         refs = [
             engine.init_process_group.remote(
                 master_address,
@@ -308,7 +320,7 @@ class PolicyTrainer:
                     if force_on_policy and self.replay_buffer.cpu_offload:
                         # The window spans the whole rollout; offload each
                         # microbatch back to CPU after use so peak GPU holds one
-                        # microbatch, not the entire buffer.
+                        # microbatch, not the entire buffer (matters for VLM).
                         exp.to_device(torch.device("cpu"))
                 window = []
             assert not window, "actor train window not flushed at epoch end"
@@ -353,10 +365,15 @@ class PolicyTrainer:
         base_action_log_probs = experience.base_action_log_probs
         rollout_log_probs = experience.rollout_log_probs
 
+        # Stage 1: prepare tensors and optional multimodal inputs.
+        multimodal_inputs = {}
+        if experience.mm_train_inputs and getattr(self.actor, "is_vlm", False):
+            multimodal_inputs = merge_mm_train_inputs(experience.mm_train_inputs, sequences.device)
+
         # AutoModel CP train context must cover both forward and backward.
         cp_context_stack = ExitStack()
 
-        # Stage 1: forward actor. CP is only an implementation detail here:
+        # Stage 2: forward actor. CP is only an implementation detail here:
         # log-probs are restored to the dense token axis before losses run.
         # The loss uses slime's global token-mean: batch_num_tokens is the action
         # token count of the whole optimizer-step batch (all microbatches, all DP
@@ -375,6 +392,7 @@ class PolicyTrainer:
             return_entropy=bool(self.args.actor.entropy_coef),
             # R3: replay the rollout's expert selection (None when routing replay off).
             routed_experts=experience.routed_experts,
+            **multimodal_inputs,
         )
         action_log_probs = model_output["action_log_probs"]
         if old_action_log_probs is None:
@@ -407,20 +425,12 @@ class PolicyTrainer:
                         f.write(f"{j}\t{t}\t{v:.6f}\t{a:.6f}\t{m}\n")
                 logger.info(f"MOLT_DUMP_ROLLOUT_LOGPROBS: wrote token-level logprob dump to {dump_path}")
 
-        # SAO: ratio denominator is pi_rollout (vLLM), collapsing pi_old into it.
-        if self.args.algo.sao:
-            if rollout_log_probs is None:
-                raise ValueError("--algo.sao needs rollout_log_probs (pi_rollout); none were captured")
-            denom_log_probs = rollout_log_probs
-        else:
-            denom_log_probs = old_action_log_probs
-
-        # Stage 2: compute policy loss and metric-only policy diagnostics.
+        # Stage 3: compute policy loss and metric-only policy diagnostics.
         # reported_actor_loss is a plain per-token mean for logging, decoupled
         # from the global token-mean used for the gradient (actor_loss).
         actor_loss, reported_actor_loss, clip_ratio, policy_kl, vllm_kl, is_filter_ratio = self.actor_loss_fn(
             action_log_probs,
-            denom_log_probs,
+            old_action_log_probs,
             advantages,
             action_mask=action_mask,
             rollout_log_probs=rollout_log_probs,
@@ -434,7 +444,7 @@ class PolicyTrainer:
         if is_filter_ratio is not None:
             experience.info["is_filter_ratio"] = is_filter_ratio.detach()
 
-        # Stage 3: add optional KL-as-loss, MoE aux loss, and entropy regularization.
+        # Stage 4: add optional KL-as-loss, MoE aux loss, and entropy regularization.
         if self.args.algo.kl.use_loss:
             if self.args.algo.kl.init_coef > 0:
                 approx_kl = compute_approx_kl(
@@ -492,7 +502,7 @@ class PolicyTrainer:
         else:
             entropy_loss = None
 
-        # Stage 4: backward and optimizer step. The global token denominator
+        # Stage 5: backward and optimizer step. The global token denominator
         # already normalizes over the whole optimizer-step batch, so the loss
         # must NOT be re-divided by the accumulation count (scale_loss_by_
         # accumulation=False) — same contract as the SFT trainer.
@@ -520,7 +530,7 @@ class PolicyTrainer:
                 self.actor_optim, self.actor, self.actor_scheduler, name="actor", accumulate=False
             )
 
-        # Stage 5: collect weighted metrics from this microbatch.
+        # Stage 6: collect weighted metrics from this microbatch.
         metrics = {"policy_loss": reported_actor_loss.detach()}
         weights = {"policy_loss": "token"}
         if entropy_loss is not None:
@@ -578,6 +588,7 @@ class PolicyTrainer:
         from torch.distributed.tensor import DTensor
 
         ep_size = getattr(self.strategy.args.fsdp, "ep_size", 1) or 1
+        model_config = getattr(model, "config", None)
 
         # Pack many small per-tensor broadcasts into large batched broadcasts.
         # Inspired by vLLM's `vllm.distributed.weight_transfer.packed_tensor`
@@ -671,6 +682,8 @@ class PolicyTrainer:
             for hf_name, hf_weight in hf_pairs:
                 if not torch.is_tensor(hf_weight) or not hf_weight.is_floating_point():
                     continue
+                if _skip_tied_lm_head(model_config, hf_name):
+                    continue  # redundant: vLLM gets the shared weight via embed_tokens
                 # Dtype-faithful refit: keep each param in its native/compute dtype
                 # instead of force-casting everything to a single `param_dtype`. vLLM's
                 # `load_weights` casts each tensor to *that param's own* target dtype via
@@ -702,15 +715,23 @@ class PolicyTrainer:
             _flush()
 
         if check_weight_update:
-            per_engine = ray.get([e.weight_update_missing.remote() for e in self.vllm_engines])
-            missing = sorted({name for lst in per_engine for name in lst})
-            if missing:
+            # Which of the engine's weights did this broadcast never land on? The engines are
+            # replicas, so one answers for all.
+            unaddressed = ray.get(self.vllm_engines[0].weight_update_missing.remote())
+            if unaddressed is None:
                 logger.warning(
-                    f"[check_weight_update] {len(missing)} vLLM params NOT refreshed by this broadcast "
-                    f"(stale rollout weights); sample: {missing[:10]}"
+                    "[check_weight_update] cannot verify: vLLM reports assigned weights under names "
+                    "that do not match its own parameters"
+                )
+            elif unaddressed:
+                # A tied lm_head is in here by design (it reaches vLLM via embed_tokens);
+                # anything else kept its old value and makes the rollout stale.
+                logger.warning(
+                    f"[check_weight_update] {len(unaddressed)} vLLM weights the broadcast never "
+                    f"landed on: {unaddressed[:10]}"
                 )
             else:
-                logger.info("[check_weight_update] all vLLM params refreshed by this broadcast")
+                logger.info("[check_weight_update] the broadcast landed on every vLLM weight")
 
         torch.cuda.empty_cache()
         torch_dist_barrier_and_cuda_sync()
@@ -746,6 +767,7 @@ class PolicyModelActor(BaseModelActor):
             activation_checkpointing=args.actor.gradient_checkpoint,
             packing_samples=strategy.args.fsdp.packing_samples,
             temperature=strategy.args.rollout.temperature,
+            freeze_visual_encoder=getattr(strategy.args.actor, "freeze_visual_encoder", False),
             freeze_moe_router=getattr(strategy.args.actor, "freeze_moe_router", False),
             moe_aux_loss_coef=args.actor.aux_loss_coef,
             routing_replay=getattr(args.train, "routing_replay", False),
@@ -769,16 +791,16 @@ class PolicyModelActor(BaseModelActor):
             pretrain, actor.model, "left", use_fast=not strategy.args.data.disable_fast_tokenizer
         )
 
-        actor_cfg = dict(
-            optim=args.actor.optim,
-            muon=vars(args.actor.muon),
-            adam=vars(args.actor.adam),
-            lr_scheduler=args.actor.lr_scheduler,
-            lr_warmup_ratio=args.actor.lr_warmup_ratio,
-            min_lr_ratio=args.actor.min_lr_ratio,
-            max_norm=args.actor.max_norm,
-            scheduler_steps=max_steps,
-        )
+        actor_cfg = {
+            "optim": args.actor.optim,
+            "muon": vars(args.actor.muon),
+            "adam": vars(args.actor.adam),
+            "lr_scheduler": args.actor.lr_scheduler,
+            "lr_warmup_ratio": args.actor.lr_warmup_ratio,
+            "min_lr_ratio": args.actor.min_lr_ratio,
+            "max_norm": args.actor.max_norm,
+            "scheduler_steps": max_steps,
+        }
         self.actor, self.actor_optim, self.actor_scheduler = strategy.prepare((actor, actor_cfg))
 
         # load checkpoint
@@ -844,12 +866,17 @@ class PolicyModelActor(BaseModelActor):
     def forward(self, experience) -> torch.Tensor:
         """Old actor action log-probs for one rollout Experience — the old log-probs used off-policy
         and the student side of the KL-as-reward path (on_policy_distill / reinforce-KL). reload()
-        first fetches the sample's heavy tensors (token ids / routing) from the producing
+        first fetches the sample's heavy tensors (token ids / images / routing) from the producing
         runner's shared-memory store — they reach this rank straight from the runner, never through
         the controller. Called per sample by execute_batch; the controller attaches the result as
         action_log_probs."""
         experience = experience.reload()
         device = torch.cuda.current_device()
+
+        # VLM: merge pre-processed multimodal inputs.
+        mm_inputs = {}
+        if experience.mm_train_inputs and getattr(self.actor, "is_vlm", False):
+            mm_inputs = merge_mm_train_inputs(experience.mm_train_inputs, device)
 
         routed_experts = experience.routed_experts
         self.actor.eval()
@@ -860,6 +887,7 @@ class PolicyModelActor(BaseModelActor):
                 experience.attention_mask.to(device),
                 # R3: replay rollout routing so old picks the same experts as training.
                 routed_experts=routed_experts.to(device) if routed_experts is not None else None,
+                **mm_inputs,
             )
         self.actor.train()  # reset model state
         return output["action_log_probs"].to("cpu")
@@ -871,7 +899,7 @@ class PolicyModelActor(BaseModelActor):
         return self.checkpoint_states
 
     def append(self, experience: Experience):
-        # reload() fetches the sample's heavy tensors (token ids / routing) from the
+        # reload() fetches the sample's heavy tensors (images / token ids / routing) from the
         # producing runner's shared-memory store — they reach this rank straight from the runner,
         # never through the controller. A no-op for an already-local experience.
         self.trainer.replay_buffer.append(experience.reload())

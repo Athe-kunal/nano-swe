@@ -77,21 +77,18 @@ class NaiveReplayBuffer:
     def __len__(self) -> int:
         if self.dynamic_batch:
             return len(self.dynamic_indices)
-        else:
-            return len(self.items)
+        return len(self.items)
 
     def __getitem__(self, idx: int) -> Experience:
         if self.dynamic_batch:
             indices = self.dynamic_indices[idx]
             return [self.items[i] for i in indices]
-        else:
-            return self.items[idx]
+        return self.items[idx]
 
     def collate_fn(self, batch) -> Experience:
         if self.dynamic_batch:
             batch = batch[0]
-        experience = make_experience_batch(batch)
-        return experience
+        return make_experience_batch(batch)
 
     def setup_dynamic_batch(self, strategy):
         args = strategy.args
@@ -125,7 +122,7 @@ class NaiveReplayBuffer:
                 )
 
         # split by train_batch_size, sync num_microbatches across dp
-        num_microbatches: List[int] = []
+        num_microbatches = []
         for i in range(num_steps):
             start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
             num_microbatches.append(
@@ -142,8 +139,8 @@ class NaiveReplayBuffer:
         num_microbatches = num_microbatches.tolist()
 
         # balance the number of microbatches across steps
-        micro_batch_indices: List[List[int]] = []
-        data_partitions: List[List[List[int]]] = []
+        micro_batch_indices = []
+        data_partitions = []
         for i, num_mbs in enumerate(num_microbatches):
             start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
             samples = sample_lengths[start:end]
@@ -159,7 +156,7 @@ class NaiveReplayBuffer:
         # Mark each step's last microbatch as the optimizer-step boundary. The
         # global token-mean (one denominator per window) handles per-microbatch
         # token-count weighting, so no per-microbatch loss scale is needed.
-        optimizer_steps: List[int] = []
+        optimizer_steps = []
         for partitions in data_partitions:
             optimizer_steps.extend([0] * (len(partitions) - 1) + [1])
         self.dynamic_optimizer_step = optimizer_steps

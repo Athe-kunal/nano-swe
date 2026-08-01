@@ -46,8 +46,9 @@ def prepare_datasets(strategy, tokenizer):
     # BOTH runner types consume the SAME chat-format dataset (--data.apply_chat_template);
     # Runner.PRERENDER_PROMPT only decides WHERE the template is applied. The step runner needs the
     # dataset to pre-render; the chat runner hands the raw messages to the chat server, which renders
-    # them exactly once with the model's own template (a dataset pre-render would double-template) —
-    # so for chat agents the flag is required, never applied dataset-side.
+    # them exactly once with the model's own template (a dataset pre-render would double-template and
+    # drop the image on structured-content VLMs) — so for chat agents the flag is required, never
+    # applied dataset-side.
     from nano_swe.agents.base import load_agent_runner
 
     prerender = True
@@ -128,7 +129,7 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
     Robust to dropped rollouts: samples are grouped by their rollout ``group_id``
     (falling back to the prompt string when group ids are absent) rather than a
     rigid ``reshape(-1, n_samples_per_prompt)``. A rollout dropped during
-    generation (empty / zero-action — see
+    generation (empty / zero-action / VLM-truncated — see
     ``SamplesGenerator._process_response_into_experience``) only shrinks that
     prompt's group instead of crashing the reshape or misaligning samples across
     prompt boundaries.
@@ -137,7 +138,7 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
         return {}
 
     prompt_to_datasource = {}
-    for datasources, prompts, labels, _images, _tools in eval_dataloader:
+    for datasources, prompts, _labels, _images, _tools in eval_dataloader:
         for prompt, datasource in zip(prompts, datasources):
             if isinstance(prompt, list):
                 # Chat rows pass through as messages; key on the last user turn's text —
@@ -285,11 +286,11 @@ class BaseRLTrainer:
         raise NotImplementedError("fit method is not implemented")
 
     def train_step(self, rollout_samples, global_step: int) -> Tuple[Dict, int]:
-        # `rollout_samples` are lazy Experiences: each sample's heavy tensors (token ids /
+        # `rollout_samples` are lazy Experiences: each sample's heavy tensors (images / token ids /
         # rollout routing) sit in shared memory (the producing runner's object store) behind a handle.
         # The flow below is the ordinary single-controller RL step — balance, make experience, compute
         # advantages, push, optimize — and only the ranks that consume a sample fetch its heavy tensors
-        # (Experience.reload()). So the controller works with light handles and a full rollout batch
+        # (Experience.reload()). So the controller works with light handles and a full image batch
         # never concentrates on one node; the transfer is transparent (Ray resolves each handle where
         # it is used).
         t0 = time.time()
@@ -301,10 +302,7 @@ class BaseRLTrainer:
         # blob from shared memory and read sequences out — leaving heavy_ref set so the sample still
         # ships cheaply to its rank below; otherwise read the local tensor directly.
         first = experiences[0]
-        if first.heavy_ref is not None:
-            first_seq = ray.get(first.heavy_ref)["sequences"]
-        else:
-            first_seq = first.sequences
+        first_seq = ray.get(first.heavy_ref)["sequences"] if first.heavy_ref is not None else first.sequences
         sample0 = [
             self.tokenizer.decode(first_seq[0], skip_special_tokens=True),
             experiences[0].info["reward"][0].item(),
@@ -341,7 +339,7 @@ class BaseRLTrainer:
 
         # Push the experiences to the actor shards (and the critic, which trains on the same batch
         # with values + returns) before optimization. Each rank fetches its samples' heavy tensors
-        # from the producing runner via reload() — they reach the rank straight from the
+        # from the producing runner via reload() — the images reach the rank straight from the
         # runner, never through the controller.
         refs = self.actor_model_group.async_run_method_batch(method_name="append", experience=experiences)
         if self.critic_model_group is not None:

@@ -24,7 +24,7 @@ from torch.optim import Optimizer
 from tqdm import tqdm
 
 from nano_swe.models import SFTLoss
-from nano_swe.models.utils import split_moe_aux_loss
+from nano_swe.models.utils import masked_mean, split_moe_aux_loss
 from nano_swe.utils.distributed_sampler import DistributedSampler
 
 
@@ -120,7 +120,11 @@ class SFTTrainer:
         prepared = []
         local_num_tokens = torch.zeros((), dtype=torch.float32, device=device)
 
-        for inputs, attention_masks, loss_masks, _mm_inputs in accum_window:
+        for inputs, attention_masks, loss_masks, mm_inputs in accum_window:
+            # mm_inputs is {} for text-only batches, populated for VLM batches
+            # (pixel_values, image_grid_thw, ...). Always passed through as
+            # **kwargs to Actor.forward.
+            mm_inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in mm_inputs.items()}
             inputs = inputs.to(device).squeeze(1)
             attention_mask = attention_masks.to(device).squeeze(1)
             loss_mask = loss_masks.to(device).squeeze(1)
@@ -135,11 +139,12 @@ class SFTTrainer:
             # Count tokens on the full (unsharded) sequence. Reduced over DP only
             # — CP ranks share the sample, so global_token_count (the loss
             # denominator) must not double count them. The loss-value scale below
-            # is dp_size (correct for the reported/logged mean). The *gradient*
-            # compensation for FSDP averaging over the extra CP dim is applied
-            # separately in FsdpStrategy.backward (loss *= cp_size).
+            # is dp_size (correct for the reported/logged mean). The CP gradient
+            # needs no compensation here: Actor.forward gathers log-probs with the
+            # sharder, whose all-gather backward sums grads ×cp_size and cancels
+            # FSDP's mean over dp_cp — see FsdpStrategy.backward.
             local_num_tokens += shifted_loss_mask.sum()
-            prepared.append((inputs, attention_mask, shifted_loss_mask))
+            prepared.append((inputs, attention_mask, shifted_loss_mask, mm_inputs))
 
         batch_num_tokens = self.strategy.global_token_count(local_num_tokens)
         return prepared, batch_num_tokens
@@ -147,7 +152,7 @@ class SFTTrainer:
     def _run_microbatch(
         self, prepared_batch, batch_num_tokens, accum_steps, backward: bool = True, is_last_microbatch: bool = True
     ):
-        inputs, attention_mask, shifted_loss_mask = prepared_batch
+        inputs, attention_mask, shifted_loss_mask, mm_inputs = prepared_batch
         # CP is an Actor-internal detail (same contract as the RL policy actor):
         # pass the full sequence and let Actor.forward shard it, run the forward,
         # and gather per-token log-probs back to the dense axis. The CP train
@@ -159,6 +164,7 @@ class SFTTrainer:
             inputs,
             attention_mask=attention_mask,
             cp_context_stack=cp_context_stack,
+            **mm_inputs,
         )
         per_token_log_probs = output["log_probs"]
 
@@ -190,14 +196,17 @@ class SFTTrainer:
         if backward:
             self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
 
-        reported_sft_loss = sft_loss.detach()
-        logs_dict = {"sft_loss": reported_sft_loss.item()}
+        # Reported loss is a plain per-token mean, decoupled from the gradient
+        # normalization: `sft_loss` is divided by the WHOLE window's token count, so on
+        # its own it is a 1/accum_steps fraction, not a loss. Same reporting contract as
+        # PolicyLoss on the RL side; the window aggregate is returned separately below.
+        logs_dict = {"sft_loss": masked_mean(-per_token_log_probs.detach(), shifted_loss_mask, dim=None).item()}
         if backward:
             logs_dict["lr"] = self.scheduler.get_last_lr()[0]
             logs_dict["grad_norm"] = self.strategy.get_grad_norm(self.model)
         if self.aux_loss:
             logs_dict["aux_loss"] = aux_loss_log.item() if torch.is_tensor(aux_loss_log) else float(aux_loss_log)
-        return logs_dict, reported_sft_loss.item()
+        return logs_dict, sft_loss.detach().item()
 
     def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
         # Infer num_update_steps_per_epoch from dataloader if not provided
@@ -257,21 +266,21 @@ class SFTTrainer:
                     # Last microbatch of the window = the optimizer-step boundary, so it
                     # carries the deferred grad reduce-scatter (when MOLT_DEFER_GRAD_SYNC=1).
                     is_last_microbatch = mb_idx == len(prepared) - 1
-                    logs_dict, _ = self._run_microbatch(
+                    logs_dict, window_frac = self._run_microbatch(
                         prepared_batch, batch_num_tokens, accum_steps, is_last_microbatch=is_last_microbatch
                     )
-                    # Accumulate the DP-reduced per-microbatch loss: each already carries
-                    # the global-token denominator, so summing the reduced values over the
-                    # window gives the true window token-mean (loss_mean below). Summing the
-                    # pre-reduce local value /accum_steps would log a per-rank, mis-scaled number.
+                    # logs_dict["sft_loss"] is this microbatch's own per-token mean (live in the
+                    # bar); window_frac carries the whole window's token denominator, so only the
+                    # sum over the window is a per-token mean — that sum is the step metric, the
+                    # same quantity AutoModel's train_ft reports as "loss". Reduce it once here.
+                    loss_sum += window_frac
                     logs_dict = self.strategy.all_reduce(logs_dict)
-                    loss_sum += logs_dict["sft_loss"]
                     step_bar.set_postfix(logs_dict)
                     step_bar.update()
 
                     # logs/checkpoints/evaluation
                     if step % self.strategy.accumulated_gradient == 0:
-                        logs_dict["loss_mean"] = loss_sum
+                        logs_dict["sft_loss"] = self.strategy.all_reduce(loss_sum)
                         loss_sum = 0
                         global_step = step // self.strategy.accumulated_gradient
                         client_states = {"consumed_samples": global_step * args.train.batch_size}
@@ -310,11 +319,9 @@ class SFTTrainer:
                 for k, v in logs_dict.items():
                     self._tensorboard.add_scalar(f"train/{k}", v, global_step)
 
-        # eval
-        if global_step % args.eval.steps == 0:
-            # do eval when eval_dataloader is not None and len(dataloader) > 0, avoid zero division in eval.
-            if self.eval_dataloader is not None and len(self.eval_dataloader) > 0:
-                self.evaluate(self.eval_dataloader, global_step)
+        # eval — an empty eval_dataloader would zero-divide inside evaluate()
+        if global_step % args.eval.steps == 0 and self.eval_dataloader is not None and len(self.eval_dataloader) > 0:
+            self.evaluate(self.eval_dataloader, global_step)
 
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity on whole dev dataset as metric
@@ -350,7 +357,7 @@ class SFTTrainer:
             device = next(self.model.parameters()).device
             for batch in eval_dataloader:
                 prepared, batch_num_tokens = self._prepare_accum_window([batch], device)
-                _, reported_sft_loss = self._run_microbatch(
+                _, batch_frac = self._run_microbatch(
                     prepared[0],
                     batch_num_tokens,
                     accum_steps=1,
@@ -361,7 +368,7 @@ class SFTTrainer:
                 # eval would drift from the train loss on heterogeneous reply
                 # lengths. Weighting by the batch token count makes the final
                 # value the exact global token mean after the DP all-reduce.
-                loss_sum += reported_sft_loss * batch_num_tokens
+                loss_sum += batch_frac * batch_num_tokens
                 token_sum += batch_num_tokens
                 bar_dict = {"eval sft_loss": loss_sum / token_sum}
                 step_bar.update()

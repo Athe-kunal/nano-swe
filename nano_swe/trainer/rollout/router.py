@@ -16,12 +16,12 @@
 """Real vllm-router in front of the engine servers, + the rollout transport over it.
 
 The router load-balances the engines' OpenAI API (default consistent_hash: ``x-session-id`` affinity
-so a rollout's requests co-locate on one engine); weight sync bypasses it (NCCL to the engines).
-Everything the runners generate goes over HTTP through the router via one client,
-``RouterGenerateClient.generate(token_ids, sp) -> (RequestOutput, off_policy_len)``: token-in /
-token-out over vLLM's ``/inference/v1/generate``. Both the StepEnvRunner and the chat server
-(``_chat_server``) share it. This custom route survives the router verbatim, unlike the OpenAI
-``/v1/*`` routes whose token_ids the router schema-strips.
+so a rollout's render+generate co-locate on one engine); weight sync bypasses it (NCCL to the engines). Everything the runners generate goes over HTTP through the router via
+one client, ``RouterGenerateClient.generate(token_ids, sp, mm) -> (RequestOutput, off_policy_len)``:
+token-in / token-out over vLLM's ``/inference/v1/generate`` (VLM images are rendered server-side
+first, over ``/v1/chat/completions/render``, for their mm features). Both the StepEnvRunner and the
+chat server (``_chat_server``) share it. These custom routes survive the router verbatim, unlike the
+OpenAI ``/v1/*`` routes whose token_ids the router schema-strips.
 
 ``AgentRunnerActor`` is the rollout driver process running those runners against the router; the
 trainer round-robins prompts across a list of them (``--rollout.num_runners``).
@@ -49,14 +49,25 @@ class VllmRouterActor:
     this actor: the daemon thread never gives the GIL back, the actor's MainThread can't finish
     ``Thread.start()``, ``__init__`` never returns, and the actor hangs forever in PENDING_CREATION.
     So it gets its own process (own GIL, blocks freely); the actor just supervises it and reports the
-    URL. Fixed port (single-job runs don't collide). Weight sync bypasses the router (NCCL straight
-    to the engines)."""
+    URL. Weight sync bypasses the router (NCCL straight to the engines).
 
-    def __init__(self, worker_urls, *, policy="consistent_hash", port=30000, max_payload_mb=512):
+    Both listen ports are taken from the kernel rather than left at the router's defaults (30000 /
+    29000): a router leaked by a killed job keeps those bound, and every later job landing on that
+    node then dies at startup — the metrics listener panics first, which kills the whole subprocess.
+    Callers discover the address through ``url()``, so nothing depends on a fixed number."""
+
+    @staticmethod
+    def _free_port(host: str) -> int:
+        with socket.socket() as s:
+            s.bind((host, 0))
+            return s.getsockname()[1]
+
+    def __init__(self, worker_urls, *, policy="consistent_hash", port=None, max_payload_mb=512):
         import subprocess
         import sys
 
-        self._host, self._port = ray.util.get_node_ip_address(), port
+        self._host = ray.util.get_node_ip_address()
+        self._port = port or self._free_port(self._host)
         self._proc = subprocess.Popen(
             [
                 sys.executable,
@@ -65,7 +76,11 @@ class VllmRouterActor:
                 "--host",
                 self._host,
                 "--port",
-                str(port),
+                str(self._port),
+                "--prometheus-host",
+                self._host,
+                "--prometheus-port",
+                str(self._free_port(self._host)),
                 "--policy",
                 policy,
                 "--max-payload-size",
@@ -141,28 +156,77 @@ def _inference_sampling_params(sp) -> dict:
     return fields
 
 
+def _image_data_uri(image) -> str:
+    """PIL image -> a ``data:`` URI for the render endpoint's ``image_url`` content."""
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _align_features_to_canonical(features: dict, canonical: list, image_token_id) -> None:
+    """Point render's mm features at the image-placeholder run(s) in our canonical HF prompt IN PLACE.
+
+    vLLM splices each image's N vision embeds (from ``kwargs_data``) into a contiguous run of
+    ``image_token_id`` tokens. We DISCARD render's own ``mm_placeholders`` and take offset+length from
+    the canonical runs: for omni3 render over-counts (274, including the IMG_START/END markers) vs the
+    272 embeds, and its offset points AT a marker — trusting it splices the wrong count into the wrong
+    span (e.g. length 1 -> 1 embed spliced while the actor forwards all 272 -> train/rollout token
+    mismatch). The canonical id-``image_token_id`` runs match the embeds by construction (the same HF
+    processor built both the prompt and the training pixel_values). One run per image, left to right."""
+    ph = features.get("mm_placeholders")
+    if not isinstance(ph, dict) or not ph.get("image"):
+        raise ValueError("render features missing image mm_placeholders")
+    if image_token_id is None:
+        raise ValueError("image_token_id is required to align mm placeholders to the canonical prompt")
+    runs, search, n = [], 0, len(canonical)
+    for i in range(len(ph["image"])):
+        start = search
+        while start < n and canonical[start] != image_token_id:
+            start += 1
+        if start >= n:
+            raise ValueError(f"image placeholder token {image_token_id} not found in canonical prompt (image {i})")
+        end = start + 1
+        while end < n and canonical[end] == image_token_id:
+            end += 1
+        runs.append({"offset": start, "length": end - start})
+        search = end
+    ph["image"] = runs
+
+
 class RouterGenerateClient:
     """The unified rollout transport over the router.
 
-    ``generate(token_ids, sp) -> (RequestOutput, off_policy_len)`` is the token-in / token-out
+    ``generate(token_ids, sp, mm) -> (RequestOutput, off_policy_len)`` is the token-in / token-out
     path for BOTH the StepEnvRunner and the chat server, over vLLM's ``/inference/v1/generate`` (vime's
     transport). It carries token_ids + vLLM-shaped logprobs + R3 routed_experts (base64 npy, unified
-    prompt+gen array). This custom route is forwarded VERBATIM by the vllm-router (unlike the OpenAI
-    ``/v1/*`` routes, whose token_ids the router schema-strips). It also carries the shared aiohttp
-    session (``.http``)."""
+    prompt+gen array). VLM: it first ``/v1/chat/completions/render``s the image(s) SERVER-SIDE to get
+    vLLM's mm ``features`` (pixel tensors), realigns those placeholders onto our canonical HF prompt
+    ids, and sends them with the generate — the image is embedded by STOCK server-side mm processing
+    (no vLLM source patch). Both routes are custom, so the vllm-router forwards them VERBATIM (unlike
+    the OpenAI ``/v1/*`` routes, whose token_ids the router schema-strips). It also carries the shared
+    aiohttp session (``.http``)."""
 
-    def __init__(self, http_client, *, model_name="policy"):
+    def __init__(self, http_client, *, model_name="policy", image_token_id=None):
         self.http = http_client
         self.model_name = model_name
+        self.image_token_id = image_token_id  # HF processor's image placeholder id (VLM realign)
 
-    async def generate(self, prompt_token_ids, sampling_params, session_id=None):
+    async def generate(self, prompt_token_ids, sampling_params, multi_modal_data=None, session_id=None):
         prompt = list(prompt_token_ids)
         # ``session_id`` pins every request it tags to ONE engine (``x-session-id`` + the router's
-        # consistent_hash policy). The runner passes ONE id per rollout, so all of a rollout's turns
-        # co-locate and (with prefix caching on) the multi-turn KV prefix stays warm. vime/slime pin
+        # consistent_hash policy). The runner passes ONE id per rollout, so all of a rollout's turns —
+        # and each turn's render + generate — co-locate: render's mm features resolve on the engine that
+        # generates, and (with prefix caching on) the multi-turn KV prefix stays warm. vime/slime pin
         # the same way, per sample. Falls back to a per-call id when the caller passes none.
         sid = session_id or uuid4().hex
-        return await self._generate_inference(prompt, sampling_params, sid)
+        features = None
+        if multi_modal_data and multi_modal_data.get("image"):
+            rendered = await self._render(multi_modal_data["image"], sid)
+            features = rendered.get("features")
+            if features is None:
+                raise RuntimeError("/v1/chat/completions/render returned no features for an image prompt.")
+            _align_features_to_canonical(features, prompt, self.image_token_id)
+        return await self._generate_inference(prompt, sampling_params, features, sid)
 
     async def _post(self, path, payload, session_id, *, retries=3):
         """POST to a router route (``model`` + the routing-affinity header injected), return parsed JSON.
@@ -170,8 +234,8 @@ class RouterGenerateClient:
         Retries transient failures with linear backoff — a 5xx or a refused/dropped connection while
         the router or an engine is still warming up (its port binds before its workers pass health
         checks) or is briefly overloaded — so a hiccup costs a retry, not a dropped rollout (vime/slime
-        retry the same way). A 4xx is a real client bug and a read timeout is a wedged engine (caught by
-        the session's ``sock_read``): both fail fast rather than burn the retry budget."""
+        retry the same way). A 4xx is a real client bug, so it fails fast rather than burn the retry
+        budget. The session sets no read timeout, so a slow generation never lands here at all."""
         headers = {"x-session-id": session_id} if session_id else None
         body = {"model": self.model_name, **payload}
         for attempt in range(retries):
@@ -185,10 +249,21 @@ class RouterGenerateClient:
                     raise
             await asyncio.sleep(attempt + 1)
 
-    async def _generate_inference(self, prompt_token_ids, sampling_params, session_id):
+    async def _render(self, images, session_id):
+        """POST the image(s) to the stock ``/v1/chat/completions/render`` route (server-side chat
+        template + mm processing) and return its ``{token_ids, features}``. We use ONLY ``features``
+        (vLLM's mm pixel tensors -> N vision embeds); the placeholder ranges are realigned to our
+        canonical prompt by the caller. The router forwards this custom route verbatim."""
+        content = [{"type": "image_url", "image_url": {"url": _image_data_uri(im)}} for im in images]
+        body = {"messages": [{"role": "user", "content": content}]}
+        return await self._post("/v1/chat/completions/render", body, session_id)
+
+    async def _generate_inference(self, prompt_token_ids, sampling_params, features, session_id):
         # R3 routed_experts are enabled ENGINE-side (create_vllm_engines(enable_return_routed_experts)
         # <- --train.routing_replay); the engine then returns them on the choice, which we decode below.
         body = {"token_ids": list(prompt_token_ids), "sampling_params": _inference_sampling_params(sampling_params)}
+        if features is not None:
+            body["features"] = features
         out = await self._post("/inference/v1/generate", body, session_id)
         c = out["choices"][0]
         ids = list(c.get("token_ids") or [])
@@ -228,40 +303,49 @@ class AgentRunnerActor:
 
     Loads the agent runner + tokenizer, holds one aiohttp session to the router + a
     ``RouterGenerateClient`` over it, and runs N rollouts of a prompt concurrently. Grading
-    runs in-process (GIL-bound), so a fleet of these actors (``--rollout.num_runners``)
-    parallelizes that work; the trainer round-robins prompts across them (no pool wrapper —
-    just a list + an index)."""
+    and VLM image processing run in-process (GIL-bound), so a fleet of these actors
+    (``--rollout.num_runners``) parallelizes that work; the trainer round-robins prompts
+    across them (no pool wrapper — just a list + an index)."""
 
-    async def __init__(self, agent_path, router_url, *, model_path=None, model_name="policy"):
+    def __init__(self, agent_path, router_url, *, model_path=None, model_name="policy"):
         import aiohttp
 
         from nano_swe.agents.base import load_agent_runner  # lazy: router.py is imported by _chat_server
         from nano_swe.utils import get_tokenizer
+        from nano_swe.utils.vlm_utils import media_token_ids
 
         self._runner = load_agent_runner(agent_path)
         self._tokenizer = get_tokenizer(model_path, None) if model_path else None
-        # total=None: a single long-context / multi-turn generation can run many minutes (aiohttp's
-        # 300s default would silently drop 32K rollouts). sock_read=900 still catches a HUNG engine
-        # (stream stalls, no bytes for 15 min) so one wedged request can't hang the whole step; a
-        # crashed engine fails fast via a connection error. limit=0: don't cap concurrency to the
-        # engine fleet at aiohttp's default of 100 connections.
+        # Image/video placeholder ids, cached once — _process_response_into_experience uses them to
+        # detect an image dropped by max_len truncation (vit-embed misalignment) and count tokens.
+        self._media_ids = media_token_ids(self._tokenizer) if self._tokenizer else set()
+        # VLM image placeholder id (from the HF processor) — the transport uses it to align render's
+        # mm features onto our canonical prompt's image-token run (see _align_features_to_canonical).
+        image_token_id = getattr(self._tokenizer, "image_token_id", None)
+        # No timeout at all. /inference/v1/generate is non-streaming, so the engine sends nothing
+        # until the turn is fully generated: to the client "still generating" and "wedged" are the
+        # same silence, and any finite read timeout eventually kills the former. A slow turn then
+        # gets resent and re-runs from token 0, hitting the same wall — the retry can never
+        # succeed. slime takes the same position (httpx.Timeout(None) on its rollout client).
+        # A crashed engine still surfaces immediately as a connection error, which _post retries.
+        # limit=0: don't cap concurrency to the engine fleet at aiohttp's default of 100.
         self._http = aiohttp.ClientSession(
             base_url=router_url,
-            timeout=aiohttp.ClientTimeout(total=None, sock_read=900),
+            timeout=aiohttp.ClientTimeout(total=None),
             connector=aiohttp.TCPConnector(limit=0),
         )
-        self._client = RouterGenerateClient(self._http, model_name=model_name)
+        self._client = RouterGenerateClient(self._http, model_name=model_name, image_token_id=image_token_id)
 
     async def ready(self):
         return True
 
-    async def run_group(self, prompt, label, sampling_params, max_length, n_samples, tools=None):
+    async def run_group(self, prompt, label, images, sampling_params, max_length, n_samples, tools=None):
         """N rollouts of one prompt (unchanged runner) -> per step-sample ``(experience, drop_reason)``.
 
         Each usable trajectory is built into a train-ready Experience HERE, on the producing runner,
-        then `offload`ed: its heavy tensors (token ids / rollout routing) stay in THIS
-        node's object store and only the lazy handle travels to the controller — so a large batch
-        never concentrates on one node. Tagged group_id (per prompt; GRPO
+        then `offload`ed: its heavy tensors (images / token ids / rollout routing) stay in THIS
+        node's object store and only the lazy handle travels to the controller — so a 256-session
+        batch of screenshots never concentrates on one node. Tagged group_id (per prompt; GRPO
         baseline) + rollout_id (per rollout; multi-turn step-samples share it). A failed/unusable
         rollout is dropped, never sinks the group."""
         from nano_swe.trainer.rollout.samples_generator import SamplesGenerator
@@ -275,6 +359,7 @@ class AgentRunnerActor:
                 max_length=max_length,
                 hf_tokenizer=self._tokenizer,
                 llm_engine=self._client,
+                images=images,
                 tools=tools,
             )
             for _ in range(n_samples)
@@ -287,7 +372,9 @@ class AgentRunnerActor:
             rollout_id = uuid4().hex
             for traj in r if isinstance(r, list) else [r]:
                 traj.group_id, traj.rollout_id = group_id, rollout_id
-                exp, drop_reason = SamplesGenerator._process_response_into_experience(traj, max_length)
+                exp, drop_reason = SamplesGenerator._process_response_into_experience(
+                    traj, self._media_ids, max_length
+                )
                 if exp is None:
                     results.append((None, drop_reason))
                     continue
@@ -297,7 +384,7 @@ class AgentRunnerActor:
         return results
 
 
-def create_vllm_router(engines, *, policy="consistent_hash", port=30000):
+def create_vllm_router(engines, *, policy="consistent_hash", port=None):
     """Serve each engine's OpenAI API + launch the vllm-router in front; return (router, url).
 
     Default policy ``consistent_hash`` routes by the ``x-session-id`` header so a rollout's render +

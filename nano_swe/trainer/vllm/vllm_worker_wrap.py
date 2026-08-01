@@ -74,9 +74,8 @@ class WorkerWrap:
             (name, part.view(dtype).view(*shape)) for (name, dtype, shape), part in zip(metas, buf.split(sizes))
         ]
         loaded = self.model_runner.model.load_weights(weights=weights)
-        # Accumulate refreshed param names for the optional whole-broadcast coverage
-        # check (--train.check_weight_update_equal); a no-op unless armed via
-        # reset_weight_update_check().
+        # Collect the names vLLM says it assigned, for the exact by-name coverage check
+        # (--train.check_weight_update_equal). Only armed between reset/report calls.
         if getattr(self, "_weight_update_loaded", None) is not None and loaded:
             self._weight_update_loaded.update(loaded)
         # Warn on EVERY refit flush that vLLM ignored entirely (loaded nothing) -- a real
@@ -97,16 +96,23 @@ class WorkerWrap:
         del buf
 
     def reset_weight_update_check(self):
-        """Begin tracking which params load_weights assigns across this refit's flushes."""
+        """Start collecting the param names ``load_weights`` assigns in the coming broadcast."""
         self._weight_update_loaded = set()
 
     def weight_update_missing(self):
-        """This worker's float params that NO flush of the last broadcast refreshed
-        (stale rollout weights), then stop tracking. Names are vLLM-internal, matching
-        load_weights' return, so the set-difference is apples-to-apples."""
-        loaded = getattr(self, "_weight_update_loaded", None)
-        self._weight_update_loaded = None
-        if loaded is None:
-            return []
-        held = {n for n, p in self.model_runner.model.named_parameters() if p.is_floating_point()}
-        return sorted(held - loaded)
+        """This worker's float params that the broadcast never assigned, by exact name.
+
+        ``None`` when the names are not comparable — either the model reports nothing, or it
+        reports names from a different namespace than ``named_parameters()`` (vLLM models are
+        free to return the pre-mapping or the fused name). The subset test is what makes this
+        safe: without it, a namespace mismatch reads as "the whole model is stale", which is
+        how a by-name check false-alarms.
+
+        A weight the refit skips on purpose is listed too — a tied ``lm_head`` is never sent
+        because it reaches vLLM through ``embed_tokens`` — so read the names, not the count.
+        """
+        loaded, self._weight_update_loaded = getattr(self, "_weight_update_loaded", None), None
+        if not loaded:
+            return None
+        held = {name for name, param in self.model_runner.model.named_parameters() if param.is_floating_point()}
+        return sorted(held - loaded) if loaded <= held else None

@@ -21,17 +21,15 @@ import os
 from contextlib import nullcontext
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from nano_swe.trainer.fsdp.packing import (
-    cp_dtensor_full_sequence,
-    cp_local_seq_index,
     is_automodel_custom_model,
     pack_padded_batch,
-    pad_to_cp_multiple,
     unpack_to_padded,
 )
 
@@ -88,27 +86,27 @@ def _validate_attn_implementation(attn_implementation: str) -> None:
 
 
 def _resolve_custom_backend_attn(attn_implementation: str, packing_samples: bool) -> str:
-    if packing_samples:
-        if attn_implementation == "te":
+    match (packing_samples, attn_implementation):
+        case (True, "te"):
             return "te"
-        if attn_implementation == "tilelang":
+        case (True, "tilelang"):
             # DSA (glm_moe_dsa / deepseek_v3.2) is THD-native: its sparse indexer
             # *requires* qkv_format='thd', which is exactly the packed layout.
             return "tilelang"
-        if attn_implementation == "flash_attention_2":
+        case (True, "flash_attention_2"):
             raise ValueError(
                 "--fsdp.packing_samples with AutoModel custom models requires --fsdp.attn_implementation te. "
                 "HF fallback packing is removed in this branch."
             )
-        raise ValueError(
-            "--fsdp.packing_samples supports only --fsdp.attn_implementation te, tilelang, or flash_attention_2."
-        )
-
-    if attn_implementation in _CUSTOM_ATTN_IMPLEMENTATIONS:
-        return attn_implementation
-
-    print(f"[Attn] AutoModel custom models do not use {attn_implementation}; using sdpa backend.")
-    return "sdpa"
+        case (True, _):
+            raise ValueError(
+                "--fsdp.packing_samples supports only --fsdp.attn_implementation te, tilelang, or flash_attention_2."
+            )
+        case (False, attn) if attn in _CUSTOM_ATTN_IMPLEMENTATIONS:
+            return attn
+        case (False, _):
+            print(f"[Attn] AutoModel custom models do not use {attn_implementation}; using sdpa backend.")
+            return "sdpa"
 
 
 def _will_use_hf_model(pretrain_or_model, default: bool = True) -> bool:
@@ -132,6 +130,14 @@ def _will_use_hf_model(pretrain_or_model, default: bool = True) -> bool:
 
 
 def _class_source_supports_thd_packing(model_cls) -> bool:
+    """Checks whether a model class's source references THD-packed attention.
+
+    THD packing concatenates variable-length sequences into a single
+    [tokens, heads, head_dim] tensor (no padding), relying on `cu_seqlens`
+    to mark sequence boundaries. A model's source mentioning both
+    `qkv_format` and `cu_seqlens` is treated as a signal that it supports
+    this layout.
+    """
     try:
         source_path = inspect.getsourcefile(model_cls)
     except (TypeError, OSError):
@@ -165,6 +171,15 @@ def _automodel_arch_supports_thd_packing(pretrain_or_model) -> bool:
 
 
 def _automodel_custom_supports_thd_packing(model: nn.Module) -> bool:
+    """Checks whether a NeMo AutoModel custom model supports THD packing.
+
+    Only custom (non-HF) AutoModel models are considered — see
+    `is_automodel_custom_model`. For those, every class in the model's
+    MRO (its own class plus all parent classes) is scanned with
+    `_class_source_supports_thd_packing`; if any of them references
+    `qkv_format` and `cu_seqlens`, the model is assumed to support the
+    packed [tokens, heads, head_dim] attention layout.
+    """
     if not is_automodel_custom_model(model):
         return False
     return any(_class_source_supports_thd_packing(cls) for cls in type(model).__mro__)
@@ -173,22 +188,43 @@ def _automodel_custom_supports_thd_packing(model: nn.Module) -> bool:
 class _AttrDict(dict):
     """Dict output that also supports ``output.foo`` trainer access."""
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
+        """Returns ``self[name]``, raising ``AttributeError`` instead of ``KeyError``."""
         try:
             return self[name]
         except KeyError as exc:
             raise AttributeError(name) from exc
 
-    def __setattr__(self, name, value):
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Sets ``self[name] = value``, so attribute assignment updates the dict."""
         self[name] = value
 
 
-def _normalize_output(output):
+def _normalize_output(output: Union[torch.Tensor, dict, _AttrDict]) -> _AttrDict:
+    """Wraps a model output into an ``_AttrDict`` for attribute-style access.
+
+    A bare tensor is wrapped as ``logits``; a plain dict is wrapped as-is;
+    an already-normalized ``_AttrDict`` is returned unchanged.
+    """
     if isinstance(output, torch.Tensor):
         return _AttrDict(logits=output)
     if isinstance(output, dict) and not isinstance(output, _AttrDict):
         return _AttrDict(output)
     return output
+
+
+def _first_token_id(config, *attr_names):
+    """First integer token id among ``attr_names`` on the VLM config, else None.
+
+    VLM families name the media placeholder id differently (image_token_id /
+    image_token_index / img_context_token_id). Uses ``isinstance(int)`` (not
+    truthiness) so a valid id of 0 is not skipped.
+    """
+    for name in attr_names:
+        tid = getattr(config, name, None)
+        if isinstance(tid, int):
+            return tid
+    return None
 
 
 def _mtp_off_kwargs(pretrain_or_model) -> dict:
@@ -242,8 +278,8 @@ class BaseModel(nn.Module):
         activation_checkpointing: Union[bool, str] = False,
         packing_samples: bool = False,
         temperature: float = 1.0,
+        freeze_visual_encoder: bool = False,
         freeze_moe_router: bool = False,
-        freeze_attention: bool = False,
         use_fp32_master_weights: bool = True,
         moe_aux_loss_coef: float = 0.0,
         routing_replay: bool = False,
@@ -257,11 +293,12 @@ class BaseModel(nn.Module):
         self.packing_samples = packing_samples
         self.device_mesh = device_mesh
         mesh_dims = getattr(device_mesh, "mesh_dim_names", ()) or ()
-        self.cp_mesh = device_mesh["cp"] if device_mesh is not None and "cp" in mesh_dims else None
-        self.cp_size = self.cp_mesh.size() if self.cp_mesh is not None else 1
+        cp_mesh = device_mesh["cp"] if device_mesh is not None and "cp" in mesh_dims else None
+        self.cp_size = cp_mesh.size() if cp_mesh is not None else 1
 
         if not isinstance(pretrain_or_model, str):
             self.model = pretrain_or_model
+            self.is_vlm = False
             self._packing_style = "automodel" if is_automodel_custom_model(self.model) else "hf"
             configure_nemo_moe_aux_loss(self.model, moe_aux_loss_coef)
             if self.packing_samples and self._packing_style == "automodel":
@@ -279,7 +316,7 @@ class BaseModel(nn.Module):
                     )
             return
 
-        from nano_swe.utils.utils import convert_to_torch_dtype
+        from nano_swe.utils.utils import convert_to_torch_dtype, is_vlm_model
 
         # Trainable actors keep fp32 master weights unless the architecture
         # requires compute-dtype parameters. FSDP2 handles bf16 fwd/bwd via
@@ -295,7 +332,7 @@ class BaseModel(nn.Module):
         # wrong grads, so forbid it loudly. (TP/CP run on HF, so they aren't gated here.)
         if use_hf_model and ep_active:
             raise RuntimeError(
-                f"{pretrain_or_model!r}: architecture not in nemo_automodel's ModelRegistry, so nano_swe "
+                f"{pretrain_or_model!r}: architecture not in nemo_automodel's ModelRegistry, so molt "
                 "would fall back to HF transformers — which has no expert-parallel (EP) dispatch, but "
                 "EP is active here (ep_size>1). The HF fallback is forbidden under EP. Use a checkpoint "
                 "whose `architectures` is natively registered (e.g. omni3: NemotronH_Nano_Omni_Reasoning_V3, "
@@ -321,8 +358,12 @@ class BaseModel(nn.Module):
         # MixedPrecisionPolicy(param_dtype=bf16) do bf16 fwd/bwd. A bf16 master
         # rounds away AdamW updates (~LR < bf16 ULP) at small LR, so the MoE never learns.
         torch_dtype = compute_dtype if not use_fp32_master_weights else torch.float32
+        self.is_vlm = is_vlm_model(pretrain_or_model)
 
-        from nemo_automodel import NeMoAutoModelForCausalLM as ModelCls
+        if self.is_vlm:
+            from nemo_automodel import NeMoAutoModelForImageTextToText as ModelCls
+        else:
+            from nemo_automodel import NeMoAutoModelForCausalLM as ModelCls
 
         # AutoModel owns attention selection (forces sdpa under CP, falls back
         # FA2->sdpa when a model lacks FA2). When no custom path matches (e.g. dense
@@ -348,7 +389,7 @@ class BaseModel(nn.Module):
 
             backend_attn = _resolve_custom_backend_attn(attn_implementation, packing_samples)
             using_te = backend_attn == "te"
-            # Disable TE fused RoPE everywhere: some position tensors don't match
+            # Disable TE fused RoPE everywhere: VLM mRoPE position tensors don't match
             # the simpler 4D rotary layout the fused kernel expects (first surfaced under
             # Qwen3.5-MoE CP; disabled unconditionally to keep RoPE correct on all paths).
             backend_cfg = {"attn": backend_attn, "rope_fusion": False}
@@ -457,6 +498,23 @@ class BaseModel(nn.Module):
         if self.packing_samples:
             print("[Packing] Using AutoModel THD/TE packed path.")
 
+        # VLM: optionally freeze the vision encoder so only the language backbone
+        # trains (language params live under "language_model.*" / "lm_head.*").
+        #
+        # CP>1 forces freezing the vision tower: the established VLM+CP recipe trains
+        # only the language stack (the model now embeds + shards the sequence inside
+        # its own forward), and freezing keeps optimizer state off never-updated vision
+        # params. Matches the pre-migration behavior, so CP metrics stay comparable.
+        effective_freeze_visual = freeze_visual_encoder
+        if self.is_vlm and self.cp_size > 1 and not freeze_visual_encoder:
+            effective_freeze_visual = True
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                print("[VLM] cp_size>1 forces freeze_visual_encoder=True (CP trains the language stack only).")
+        if self.is_vlm and effective_freeze_visual:
+            for name, param in self.model.named_parameters():
+                if "language_model" not in name and "lm_head" not in name:
+                    param.requires_grad = False
+
         # Optionally freeze the MoE router/gate (keeps vLLM-vs-actor routing identical,
         # stabilizes training). Match by isinstance(Gate), NOT by name: the path varies by
         # arch and a `gate` name match would also catch the gated-MLP `gate_proj.weight`,
@@ -476,34 +534,37 @@ class BaseModel(nn.Module):
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 print(f"[MoE] freeze_moe_router=True: froze {n_frozen} router param tensors")
 
-        # Frozen-Attention value model: freeze self-attention, train only the MoE/FFN
-        # projections. Match by name segment (no single attention class across arches).
-        if freeze_attention:
-            n_frozen = 0
-            for name, module in self.model.named_modules():
-                if name.rsplit(".", 1)[-1] in {"self_attn", "attn", "attention"}:
-                    for param in module.parameters():
-                        param.requires_grad = False
-                        n_frozen += 1
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                print(f"[Critic] freeze_attention=True: froze {n_frozen} attention param tensors")
-
         # https://github.com/huggingface/transformers/issues/26877
         # Use `model.generate(use_cache=True)` instead.
         self.model.config.use_cache = False
 
+        if self.is_vlm:
+            self._vlm_config = self.model.config
+            # Resolve once at construction so forward() doesn't redo the attribute
+            # fallback per microbatch (field names vary across VLM families).
+            self._image_token_id = _first_token_id(
+                self._vlm_config, "image_token_id", "image_token_index", "img_context_token_id"
+            )
+            self._video_token_id = _first_token_id(
+                self._vlm_config, "video_token_id", "video_token_index", "video_context_token_id"
+            )
+
     def _restore_full_sequence(self, t, *, cp_forward, batch, seqlen, indices):
         """Map a per-token tensor back onto the full ``[B, seqlen]`` axis.
 
-        Undoes the two seq-axis transforms the forward applies before the model
-        call: CP sharding (gather the CP shards, then trim the CP pad tail back
-        to ``seqlen``) and sample packing (scatter the packed THD rows back to
-        padded ``[B, seqlen]``). No-op when neither CP nor packing is active.
+        Inverts whichever seq-axis transform the forward applied (they are mutually
+        exclusive): CP sharding under cp>1, or real-token packing under cp1. No-op
+        when neither is active.
         """
         if cp_forward:
-            t = cp_dtensor_full_sequence(t, self.cp_mesh, seq_dim=1)[:, :seqlen]
+            # Differentiable all-gather of this rank's CP shard back to the caller's
+            # [B, seqlen] coordinates via the sharder layout (narrow for round_robin,
+            # reshape for THD input_row_shape). The trailing slice drops the
+            # cp-multiple pad the forward added.
+            return self._cp_sharder.gather_token_tensor(t, seq_dim=1, trim=True, fill=0.0)[:, :seqlen]
         if self.packing_samples:
-            t = unpack_to_padded(t, indices, batch, seqlen)
+            # cp1 packing: scatter the packed [1, total] rows back to padded [B, seqlen].
+            return unpack_to_padded(t, indices, batch, seqlen)
         return t
 
     def _build_routing_targets(self, routed_experts, indices, cp_forward):
@@ -521,23 +582,25 @@ class BaseModel(nn.Module):
         n_gates = self._num_routing_gates
         global_ids = self._moe_layer_global_ids
         routing = routed_experts  # (B, vllm_layers, topk, S), seq last
-        if cp_forward:
-            # Take this rank's CP shard: pad the seq dim as the forward did, with the -1
-            # sentinel (so CP pad tokens aren't force-routed to expert 0), then gather this
-            # rank's chunks. Local length = padded / cp_size, from `routing` (pre-shard).
-            routing = pad_to_cp_multiple(routing, self.cp_size, seq_dim=3, value=-1)
-            local_positions = cp_local_seq_index(routing.shape[3] // self.cp_size, self.cp_mesh, routing.device)
-            routing = routing.index_select(3, local_positions)
-        b, n_layers, topk, s = routing.shape
-        if n_layers <= max(global_ids):
+        # The -1 fill keeps CP pad tokens out of expert 0, so RouterReplay leaves them at
+        # the live selection.
+        if cp_forward and self.packing_samples:
+            # THD layouts shard the flattened [B*S] stream and take the token axes leading,
+            # so hand the verb a token-major view; the shard returns one row per local token.
+            per_token = self._cp_sharder.shard_token_tensor(routing.permute(0, 3, 1, 2), fill=-1).long()
+        else:
+            if cp_forward:
+                routing = self._cp_sharder.shard_token_tensor(routing, seq_dim=3, fill=-1)
+            b, n_layers, topk, s = routing.shape
+            # (B, layers, topk, S) seq-last -> (B*S, layers, topk) token-major, one row per token
+            per_token = routing.permute(0, 3, 1, 2).reshape(b * s, n_layers, topk).long()
+            if self.packing_samples:
+                per_token = per_token.index_select(0, indices)  # drop pad tokens for the packed order
+        if per_token.shape[1] <= max(global_ids):
             raise ValueError(
-                f"rollout routing has {n_layers} layers but a MoE gate maps to global "
+                f"rollout routing has {per_token.shape[1]} layers but a MoE gate maps to global "
                 f"layer {max(global_ids)} (have {n_gates} gates at ids {global_ids})."
             )
-        # (B, layers, topk, S) seq-last -> (B*S, layers, topk) token-major, one row per token
-        per_token = routing.permute(0, 3, 1, 2).reshape(b * s, n_layers, topk).long()
-        if self.packing_samples:
-            per_token = per_token.index_select(0, indices)  # drop pad tokens to match the packed order
         return [per_token[:, gid, :].contiguous() for gid in global_ids]
 
     def _forward_backbone(
@@ -550,7 +613,7 @@ class BaseModel(nn.Module):
         output_hidden_states: bool = False,
         routed_experts: Optional[torch.Tensor] = None,
     ):
-        """Input prep (packing / CP sharding) + model call.
+        """Input prep (packing / VLM token-type ids / CP sharding) + model call.
 
         Returns ``(output, rolled_sequences, cp_forward, indices, batch, seqlen)``:
         ``output`` is the normalized model output (``_AttrDict`` with ``logits`` and,
@@ -559,24 +622,74 @@ class BaseModel(nn.Module):
         ``Actor`` turns this into log-probs; ``Critic`` into per-token values.
 
         ``position_ids`` is normally recomputed internally; it stays an input for
-        callers that precompute it (packed sequences).
+        callers that precompute it (packed sequences / VLM mRoPE).
         """
         batch, seqlen = sequences.size()
         attn_kwargs: dict = {}
         indices = None
         cp_forward = False
         cp_ctx_factory = nullcontext
-        if self.packing_samples:
+        cp_batch = None  # built in the packed or padded branch below; None => no CP sharding
+        self._cp_sharder = None  # set below under CP; read by _restore_full_sequence / _build_routing_targets
+        if self.packing_samples and self.cp_size == 1:
+            # cp1 real-token packing. CP is incompatible with packed sequences: cp>1
+            # falls through to the padded branch, where the model-owned sharder
+            # flattens the padded [B,S] batch to THD itself (from seq_lens).
             sequences, position_ids, rolled_sequences, indices, attn_kwargs = pack_padded_batch(
                 sequences, attention_mask, style=self._packing_style
             )
             forward_attention_mask = None
         else:
+            # THD CP flattens the batch to one token stream and asserts it divides by
+            # cp_size, so pad before anything derives from it — labels, VLM token-type ids,
+            # positions and the R3 ids must describe the same rows — with the pad id the
+            # sharder masks by; the restore trims the tail back off. round_robin needs none
+            # of this: its sharder pads the stream itself.
+            if self.packing_samples and self.cp_size > 1 and attention_mask is not None:
+                pad = -seqlen % self.cp_size
+                if pad:
+                    pad_id = getattr(getattr(self.model, "config", None), "pad_token_id", None) or 0
+                    sequences = F.pad(sequences, (0, pad), value=pad_id)
+                    attention_mask = F.pad(attention_mask, (0, pad))
+                    if position_ids is not None:  # None for VLMs: the CP hook builds mRoPE
+                        position_ids = F.pad(position_ids, (0, pad))
+                    if routed_experts is not None:
+                        # -1 = "no captured routing", so RouterReplay keeps the live choice
+                        routed_experts = F.pad(routed_experts, (0, pad), value=-1)
+
             # https://github.com/OpenRLHF/OpenRLHF/issues/217
             rolled_sequences = torch.roll(sequences, shifts=-1, dims=1)
             forward_attention_mask = attention_mask
 
-            if position_ids is None:
+            if getattr(self, "is_vlm", False):
+                if mm_inputs:
+                    image_token_id = self._image_token_id
+                    video_token_id = self._video_token_id
+                    if image_token_id is None:
+                        raise AttributeError(
+                            f"VLM config {type(self._vlm_config).__name__} missing image token id "
+                            "(expected one of: image_token_id, image_token_index, img_context_token_id)"
+                        )
+                    token_type_ids = (sequences == image_token_id).to(torch.int32)
+                    if video_token_id is not None:
+                        token_type_ids[sequences == video_token_id] = 2
+                    # Detect silent vision drop: pixel_values present but no image-context
+                    # tokens -> text-only logits while the rollout used vision (policy mismatch).
+                    if "pixel_values" in mm_inputs and not getattr(self, "_warned_no_image_tokens", False):
+                        n_img = int(token_type_ids.eq(1).sum().item())
+                        if n_img == 0:
+                            import logging as _logging
+
+                            _logging.getLogger(__name__).warning(
+                                f"VLM forward: pixel_values present but no image-context tokens "
+                                f"(id={image_token_id}) found in sequences; visual features will "
+                                f"be dropped. Check that rollout sequences preserve the image "
+                                f"placeholder (collapse / dedup may have removed them)."
+                            )
+                            self._warned_no_image_tokens = True
+                    key = "mm_token_type_ids" if "image_grid_thw" in mm_inputs else "token_type_ids"
+                    mm_inputs[key] = token_type_ids
+            elif position_ids is None:
                 if attention_mask is None:
                     position_ids = torch.arange(seqlen, device=sequences.device).unsqueeze(0).expand(batch, -1)
                 else:
@@ -584,26 +697,82 @@ class BaseModel(nn.Module):
                     position_ids.masked_fill_(attention_mask == 0, 1)
 
             if self.cp_size > 1 and attention_mask is not None:
-                from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+                # VLM + CP is model-owned: the model's `prepare_model_inputs_for_cp` hook
+                # embeds + scatters vision and round-robin-shards the primary inside its own
+                # forward; the sharder shards only the aux streams (labels/position_ids).
+                # A VLM without the hook can't shard a vision sequence -> fail fast.
+                if getattr(self, "is_vlm", False):
+                    if not hasattr(self.model, "prepare_model_inputs_for_cp"):
+                        raise RuntimeError(
+                            "VLM + CP requires the model's AutoModel CP hook "
+                            "(prepare_model_inputs_for_cp); this model lacks it — run with "
+                            "cp_size=1 (use TP/EP for memory)."
+                        )
+                    # Fail fast when image-placeholder tokens are present but mm_inputs is empty
+                    # (rollout dropped the image): get_rope_index would hit image_grid_thw=None
+                    # and crash cryptically. Likely cause: a chat agent attaching images only at
+                    # a literal <image> marker that a structured-content VLM already rendered away.
+                    if not mm_inputs and self._image_token_id is not None:
+                        n_img = int((sequences == self._image_token_id).sum().item())
+                        if n_img:
+                            raise RuntimeError(
+                                f"VLM+CP: {n_img} image placeholder token(s) present but no "
+                                "multimodal inputs — the rollout dropped the image. Structured-content "
+                                "VLMs render <image> to a model placeholder, so agents that interleave "
+                                "images at a literal <image> marker attach nothing. Fix the chat agent "
+                                "(attach images marker-independently) or use the step runner (geo3k.py)."
+                            )
 
-                # Pad to CP's 2*cp_size divisor before make_cp_batch_and_ctx injects
-                # position_ids, so the arange stays dense and shifted-token gather
-                # targets stay valid in the pad tail.
-                sequences = pad_to_cp_multiple(sequences, self.cp_size, seq_dim=1, value=0)
-                attention_mask = pad_to_cp_multiple(attention_mask, self.cp_size, seq_dim=1, value=0)
-                rolled_sequences = pad_to_cp_multiple(rolled_sequences, self.cp_size, seq_dim=1, value=0)
+                # One padded [B,S] batch for every CP model. round_robin (omni3/qwen3.6):
+                # the sharder takes the aux streams and the model shards its own primary.
+                # THD DSA (GLM): the sharder flattens [B,S] to [B*S] and contiguous-shards
+                # from seq_lens, matching the recipe's fixed-length+padding CP.
+                if self.packing_samples:
+                    seq_lens = attention_mask.sum(-1, keepdim=True).to(torch.int32)
+                    cp_batch = {
+                        "input_ids": sequences,
+                        "labels": rolled_sequences,
+                        "position_ids": position_ids,
+                        "seq_lens": seq_lens,
+                        "seq_lens_padded": seq_lens.new_full(seq_lens.shape, sequences.size(1)),
+                        "qkv_format": "thd",
+                    }
+                else:
+                    cp_batch = {
+                        "input_ids": sequences,
+                        "attention_mask": attention_mask,
+                        "labels": rolled_sequences,
+                        **mm_inputs,
+                    }
 
-                cp_batch = {
-                    "input_ids": sequences,
-                    "attention_mask": attention_mask,
-                    "labels": rolled_sequences,
-                }
-                cp_ctx_factory, cp_batch = make_cp_batch_and_ctx(self.device_mesh, cp_batch)
-                position_ids = cp_batch.get("position_ids")
-                rolled_sequences = cp_batch["labels"]
-                forward_attention_mask = cp_batch.get("attention_mask")
-                sequences = cp_batch["input_ids"]
-                cp_forward = True
+        # One model-owned sharder for every CP model: the padded [B,S] cp_batch built
+        # above (round_robin attention_mask, or THD DSA seq_lens) is sharded here; the
+        # gather in `_restore_full_sequence` inverts the layout back to [B,S].
+        if cp_batch is not None:
+            from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
+            from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
+
+            self._cp_sharder = ContextParallelSharder(
+                self.model,
+                self.device_mesh,
+                cp_batch,
+                invoke_pre_embed=True,
+                padding_token_id=getattr(getattr(self.model, "config", None), "pad_token_id", None) or 0,
+            )
+            cp_ctx_factory, cp_batch = self._cp_sharder.shard(cp_batch)
+            position_ids = cp_batch.pop("position_ids", None)
+            # The sharder pads `labels` with -100, which trips the CUDA gather bounds-check
+            # when molt reuses them as log_probs_from_logits targets; clamp to a valid id
+            # (trimmed after the gather anyway). IN-PLACE: the CP context shards this tensor
+            # at context entry, so a copy would stay full-length and silently misalign.
+            rolled_sequences = cp_batch.pop("labels").clamp_min_(0)
+            forward_attention_mask = cp_batch.pop("attention_mask", None)
+            sequences = cp_batch.pop("input_ids")
+            # Residual = THD/media kwargs the sharder/hook produced (cu_seqlens, qkv_format,
+            # _glm_dsa_cp_group, a nulled mm_token_type_ids, ...); keep only real forward
+            # kwargs, matching AutoModel's recipe (filter_forward_kwargs before model(**batch)).
+            mm_inputs = filter_forward_kwargs(self.model, cp_batch)
+            cp_forward = True
 
         # No forward-level torch.autocast: FSDP2's MixedPrecisionPolicy already
         # casts managed params to bf16 for the forward, and an extra autocast would
@@ -633,10 +802,14 @@ class BaseModel(nn.Module):
                 replay_ctx = nullcontext()
 
         with forward_ctx:
+            # Always pass sequences as keyword `input_ids`: some VLM forwards
+            # declare `pixel_values` first positional, so a bare positional would
+            # collide with it. Under CP the model embeds/scatters/shards input_ids
+            # in its own forward (no caller-side pre-embed).
             forward_kwargs = dict(
-                input_ids=sequences,
                 attention_mask=forward_attention_mask,
                 position_ids=position_ids,
+                input_ids=sequences,
                 **attn_kwargs,
                 **mm_inputs,
             )

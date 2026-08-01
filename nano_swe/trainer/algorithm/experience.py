@@ -27,35 +27,9 @@ from nano_swe.utils.utils import zero_pad_sequences
 logger = init_logger(__name__)
 
 
-def tensor_field(role: str, pad_value: int = 0, **kwargs):
-    """A (B, ...) tensor field, tagged with how `split_experience_batch`/`make_experience_batch`
-    batch it. ``role="step"``: dense next-token-axis tensor — split indexes a row, merge right-pads
-    to a common length (``pad_value``) then stacks. ``role="episode"``: per-sample scalar — split
-    indexes a row, merge just stacks (already-uniform shape, no padding needed).
-    """
+def tensor_field(role: str, **kwargs):
     metadata = dict(kwargs.pop("metadata", {}))
-    metadata["kind"] = f"{role}_tensor"
-    metadata["pad_value"] = pad_value
-    return field(metadata=metadata, **kwargs)
-
-
-def list_field(**kwargs):
-    """A per-sample list field (one entry per sample). Split indexes a row into a length-1 list;
-    merge concatenates every item's length-1 list back into the combined per-sample list."""
-    metadata = dict(kwargs.pop("metadata", {}))
-    metadata["kind"] = "list"
-    if "default" not in kwargs and "default_factory" not in kwargs:
-        kwargs["default_factory"] = list
-    return field(metadata=metadata, **kwargs)
-
-
-def dict_field(**kwargs):
-    """A dict of per-sample entries (values are themselves per-sample — one scalar/list slot per
-    sample). Split indexes every entry by row; merge collects each key's values back together
-    (as a tensor if all entries are numeric, else as a plain list)."""
-    metadata = dict(kwargs.pop("metadata", {}))
-    metadata["kind"] = "dict"
-    kwargs.setdefault("default_factory", dict)
+    metadata["tensor_role"] = role
     return field(metadata=metadata, **kwargs)
 
 
@@ -118,9 +92,7 @@ class Experience:
     # per MoE layer. Stored seq-LAST as (B, num_moe_layers, topk, T) so it rides the same
     # right-pad/concat/stack machinery as the (B, T) step tensors; the actor forward
     # permutes it back to token-major and replays it. None when R3 off.
-    # pad_value=-1: the R3 "no captured routing" sentinel (0 is a valid expert id and would
-    # force pad tokens to expert 0).
-    routed_experts: torch.Tensor = tensor_field("step", pad_value=-1, default=None)
+    routed_experts: torch.Tensor = tensor_field("step", default=None)
 
     # Policy-gradient targets
     returns: torch.Tensor = tensor_field("step", default=None)  # (B, T-1) G_t (PPO: value-regression target)
@@ -138,37 +110,39 @@ class Experience:
     # Per-sample row id within the rollout batch (set to [i] per sample by
     # make_experience). len(index) = number of samples in this Experience — the
     # advantage/merge logic relies on this count, so it is NOT pure metadata.
-    index: list[int] = list_field(default=None)
+    index: list[int] = None
 
     # Metadata (not part of RL computation)
-    prompts: list[str] = list_field()
-    labels: list[str] = list_field()
-    info: dict = dict_field()  # per-sample metrics for logging
+    prompts: list[str] = field(default_factory=list)
+    labels: list[str] = field(default_factory=list)
+    images: list = field(default_factory=list)  # per-sample image paths/URLs for VLM (None entries for text-only)
+    mm_train_inputs: list = field(default_factory=list)  # per-sample processor outputs (pixel_values dicts) for VLM
+    info: dict = field(default_factory=dict)  # per-sample metrics for logging
     # GRPO grouping identity. `group_ids` (= prompt id) is shared by all N rollouts of one
     # prompt — the trainer averages their rewards to form the baseline. `rollout_ids` is
     # unique per trajectory; multi-turn agents emit several step-samples sharing one
     # rollout_id so the trainer dedups to one reward per rollout before grouping by group_id.
-    group_ids: list[str] = list_field()
-    rollout_ids: list[str] = list_field()
+    group_ids: list[str] = field(default_factory=list)
+    rollout_ids: list[str] = field(default_factory=list)
 
     # Distributed rollout: when set, the heavy tensors below (HEAVY_FIELDS) live in the object
     # store — produced and kept on the runner that generated the sample — and this holds the ref
     # to them. The lightweight fields (masks, rewards, ids, info) stay in place, so the controller
-    # groups, scores and length-balances the sample without ever fetching its heavy tensors.
-    # `reload()` restores the heavy tensors on whichever rank consumes the sample. None once the
-    # sample is local.
+    # groups, scores and length-balances the sample without ever fetching its images. `reload()`
+    # restores the heavy tensors on whichever rank consumes the sample. None once the sample is local.
     heavy_ref: Any = None
 
-    # The fields offloaded to `heavy_ref` — everything the training forward needs (token ids,
-    # rollout routing) but the controller's advantage/length-balance logic does not, so they never
-    # reach the controller. Rule: keep only what the controller reads light; offload the rest.
-    HEAVY_FIELDS = ("sequences", "attention_mask", "rollout_log_probs", "routed_experts")
+    # The fields offloaded to `heavy_ref` — everything the training forward needs (image bytes +
+    # pixel_values, token ids, rollout routing) but the controller's advantage/length-balance logic
+    # does not, so they never reach the controller. Rule: keep only what the controller reads light;
+    # offload the rest (a byte-embedded `images` dataset column can be large).
+    HEAVY_FIELDS = ("sequences", "attention_mask", "rollout_log_probs", "routed_experts", "mm_train_inputs", "images")
 
     def offload(self) -> "Experience":
         """Move this sample's heavy fields into the object store (on the producing runner) and keep
-        only a ref, so the controller ships a handle, not the heavy tensors. Returns self. Undo with
-        `reload()`. Idempotent (like `reload()`): a no-op if already offloaded, so a second call never
-        re-puts the now-nulled fields and overwrites the ref."""
+        only a ref, so the controller ships a handle, not images. Returns self. Undo with `reload()`.
+        Idempotent (like `reload()`): a no-op if already offloaded, so a second call never re-puts the
+        now-nulled fields and overwrites the ref."""
         if self.heavy_ref is not None:
             return self
         heavy = {name: getattr(self, name) for name in self.HEAVY_FIELDS}
@@ -190,12 +164,12 @@ class Experience:
     @classmethod
     def is_step_tensor_field(cls, name: str) -> bool:
         field_info = cls.__dataclass_fields__.get(name)
-        return field_info is not None and field_info.metadata.get("kind") == "step_tensor"
+        return field_info is not None and field_info.metadata.get("tensor_role") == "step"
 
     @classmethod
     def is_episode_tensor_field(cls, name: str) -> bool:
         field_info = cls.__dataclass_fields__.get(name)
-        return field_info is not None and field_info.metadata.get("kind") == "episode_tensor"
+        return field_info is not None and field_info.metadata.get("tensor_role") == "episode"
 
     @torch.no_grad()
     def to_device(self, device: torch.device):
@@ -212,75 +186,43 @@ class Experience:
 # Batch manipulation utilities
 
 
-def _split_field(kind: str | None, value: Any, batch_size: int, name: str) -> List[Any]:
-    """Splits one field's batched `value` into `batch_size` per-sample values, per its declared
-    `kind` (see tensor_field/list_field/dict_field)."""
-    if kind in ("step_tensor", "episode_tensor"):
-        if len(value) != batch_size:
-            raise ValueError(f"Size of {name} ({len(value)}) does not match batch_size ({batch_size})")
-        return list(value)
-    if kind == "list":
-        if len(value) != batch_size:
-            # Not populated per-sample (e.g. the legacy empty-id path) — share as-is.
-            return [value] * batch_size
-        return [[v] for v in value]
-    if kind == "dict":
-        for key, v in value.items():
-            if not isinstance(v, (torch.Tensor, list)):
-                raise TypeError(f"Unsupported type for {name}[{key}]: {type(v)}")
-            if len(v) != batch_size:
-                raise ValueError(f"Size of {name}[{key}] ({len(v)}) does not match batch_size ({batch_size})")
-        return [{key: v[i] for key, v in value.items()} for i in range(batch_size)]
-    raise ValueError(f"Field '{name}' has a non-None value but no declared batching kind")
-
-
-def _merge_field(kind: str | None, values: List[Any], name: str, pad_value: int = 0) -> Any:
-    """Merges one field's per-sample `values` back into its batched value, per its declared
-    `kind` (see tensor_field/list_field/dict_field)."""
-    if kind == "step_tensor":
-        return zero_pad_sequences(values, "right", stack=True, value=pad_value)
-    if kind == "episode_tensor":
-        return torch.stack(values)
-    if kind == "list":
-        return list(itertools.chain.from_iterable(values))
-    if kind == "dict":
-        merged = {}
-        for key in values[0].keys():
-            vals = [v[key] for v in values]
-            first_type = type(vals[0])
-            if not all(isinstance(v, first_type) for v in vals):
-                raise TypeError(f"Inconsistent types in {name}[{key}]")
-            merged[key] = torch.tensor(vals) if all(isinstance(v, (int, float)) for v in vals) else vals
-        return merged
-    raise ValueError(f"Field '{name}' has a non-None value but no declared batching kind")
-
-
 def split_experience_batch(experience: Experience) -> List[Experience]:
-    """Split a batched Experience into individual single-sample Experiences.
-
-    Every field declares how it splits via its `kind` (see tensor_field/list_field/dict_field) —
-    this just reads that declaration and dispatches, instead of inspecting each value's type.
-    """
+    """Split a batched Experience into individual single-sample Experiences."""
     batch_size = len(experience.sequences)
-    experience.index = None  # freshly reassigned per sample by make_experience, not carried over
+    experience.index = None
 
-    split_by_field = {}
-    for f in fields(Experience):
-        value = getattr(experience, f.name)
-        if value is None:
-            split_by_field[f.name] = [None] * batch_size
-        else:
-            split_by_field[f.name] = _split_field(f.metadata.get("kind"), value, batch_size, f.name)
+    items = []
+    for i in range(batch_size):
+        kwargs = {}
+        for f in fields(Experience):
+            value = getattr(experience, f.name)
+            if value is None:
+                kwargs[f.name] = None
+            elif isinstance(value, torch.Tensor):
+                if len(value) != batch_size:
+                    raise ValueError(f"Size of {f.name} ({len(value)}) does not match batch_size ({batch_size})")
+                kwargs[f.name] = value[i]
+            elif isinstance(value, dict):
+                d = {}
+                for k, v in value.items():
+                    if isinstance(v, (torch.Tensor, list)):
+                        if len(v) != batch_size:
+                            raise ValueError(
+                                f"Size of {f.name}[{k}] ({len(v)}) does not match batch_size ({batch_size})"
+                            )
+                        d[k] = v[i]
+                    else:
+                        raise TypeError(f"Unsupported type for {f.name}[{k}]: {type(v)}")
+                kwargs[f.name] = d
+            elif isinstance(value, list):
+                kwargs[f.name] = [value[i]] if len(value) == batch_size else value
+        items.append(Experience(**kwargs))
 
-    return [Experience(**{name: values[i] for name, values in split_by_field.items()}) for i in range(batch_size)]
+    return items
 
 
 def make_experience_batch(items: List[Experience]) -> Experience:
-    """Combine individual single-sample Experiences into a batched Experience.
-
-    Every field declares how it merges via its `kind` (see tensor_field/list_field/dict_field) —
-    this just reads that declaration and dispatches, instead of inspecting each value's type.
-    """
+    """Combine individual single-sample Experiences into a batched Experience."""
     if not items:
         raise ValueError("Empty items list")
 
@@ -291,13 +233,35 @@ def make_experience_batch(items: List[Experience]) -> Experience:
 
     kwargs = {}
     for f in fields(Experience):
-        values = [getattr(item, f.name) for item in items]
-        if values[0] is None:
+        first = getattr(items[0], f.name)
+        if first is None:
             kwargs[f.name] = None
-        else:
-            kwargs[f.name] = _merge_field(
-                f.metadata.get("kind"), values, f.name, pad_value=f.metadata.get("pad_value", 0)
-            )
+        elif isinstance(first, torch.Tensor):
+            tensors = [getattr(item, f.name) for item in items]
+            if Experience.is_step_tensor_field(f.name):
+                # routed_experts pads with the R3 -1 sentinel (keep live routing); 0 is a
+                # valid expert id and would force pad tokens to expert 0. Others pad with 0.
+                pad_value = -1 if f.name == "routed_experts" else 0
+                kwargs[f.name] = zero_pad_sequences(tensors, "right", stack=True, value=pad_value)
+            elif Experience.is_episode_tensor_field(f.name) or first.dim() == 0:
+                kwargs[f.name] = torch.stack(tensors)
+            else:
+                raise ValueError(f"Unsupported tensor field batching rule for {f.name}")
+        elif isinstance(first, dict):
+            kwargs[f.name] = {}
+            for key in first:
+                vals = [getattr(item, f.name)[key] for item in items]
+                if not vals:
+                    continue
+                first_type = type(vals[0])
+                if not all(isinstance(v, first_type) for v in vals):
+                    raise TypeError(f"Inconsistent types in {f.name}[{key}]")
+                if all(isinstance(v, (int, float)) for v in vals):
+                    kwargs[f.name][key] = torch.tensor(vals)
+                else:
+                    kwargs[f.name][key] = vals
+        elif isinstance(first, list):
+            kwargs[f.name] = list(itertools.chain.from_iterable(getattr(item, f.name) for item in items))
 
     return Experience(**kwargs)
 
@@ -327,8 +291,8 @@ def balance_experiences(experiences, args):
     ``num_steps`` per rank -> mismatched collective shapes at the world all-reduces -> NCCL hang — so
     the trailing remainder is dropped. Within a rank the block is sorted by length descending so the
     k-th micro-batch is size-matched across ranks (else a straggler trips the 600s NCCL watchdog).
-    Metadata only — the heavy tensors stay in shared memory, so a full rollout batch never reaches
-    the controller.
+    Metadata only — the heavy tensors stay in shared memory, so a full image batch never reaches the
+    controller.
     """
     actor_world_size = args.actor.num_nodes * args.actor.num_gpus_per_node
     effective_num = actor_world_size // get_model_parallel_size(args)
